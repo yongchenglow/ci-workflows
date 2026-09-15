@@ -11,13 +11,59 @@ on:
         description: Stable review identifier, such as pr-77
         required: true
         type: string
+      application_name:
+        description: DNS-safe application name, defaults to the caller repository name
+        required: false
+        type: string
+        default: ""
+      production_namespace:
+        description: Namespace containing the registry pull secret, defaults to application_name
+        required: false
+        type: string
+        default: ""
+      registry:
+        description: Container registry
+        required: false
+        type: string
+        default: ghcr.io
+      image_name:
+        description: Image name, defaults to the caller owner and repository
+        required: false
+        type: string
+        default: ""
+      release_name:
+        description: Helm release name
+        required: false
+        type: string
+        default: app
+      chart_path:
+        description: Path to the Helm chart in the caller repository
+        required: false
+        type: string
+        default: ./helm/app
+      values_file:
+        description: Path to review Helm values in the caller repository
+        required: false
+        type: string
+        default: ./helm/app/values-review.yaml
+      review_domain:
+        description: Domain appended to review_id, such as review.example.com
+        required: true
+        type: string
+      cloudflare_zone:
+        description: Cloudflare zone containing the review domain
+        required: true
+        type: string
+      registry_secret_name:
+        description: Image pull secret copied from the production namespace
+        required: false
+        type: string
+        default: ghcr-secret
 
 env:
-  REGISTRY: ghcr.io
-  SOURCE_NAMESPACE: personal-site
   PORT_MAPPING_NAMESPACE: default
-  PORT_MAPPING_CONFIGMAP: yongchenglow-review-ports
-  INFRA_LOCK_CONFIGMAP: yongchenglow-review-infra-lock
+  PORT_MAPPING_CONFIGMAP: ci-workflows-review-ports
+  INFRA_LOCK_CONFIGMAP: ci-workflows-infra-lock
   PORT_RANGE_START: 31000
   PORT_RANGE_END: 31999
 
@@ -33,7 +79,7 @@ jobs:
       cancel-in-progress: false
     environment:
       name: review/${{ inputs.review_id }}
-      url: https://${{ inputs.review_id }}-review.${{ vars.CLOUDFLARE_DOMAIN }}
+      url: https://${{ inputs.review_id }}.${{ inputs.review_domain }}
     permissions:
       contents: read
       packages: read
@@ -43,22 +89,60 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Validate configuration
+        id: config
         env:
           REVIEW_ID: ${{ inputs.review_id }}
+          APPLICATION_NAME_INPUT: ${{ inputs.application_name }}
+          PRODUCTION_NAMESPACE_INPUT: ${{ inputs.production_namespace }}
+          IMAGE_NAME_INPUT: ${{ inputs.image_name }}
+          REVIEW_DOMAIN: ${{ inputs.review_domain }}
+          CLOUDFLARE_ZONE: ${{ inputs.cloudflare_zone }}
           KUBE_SERVER: ${{ secrets.KUBECONFIG_SERVER }}
           KUBE_TOKEN: ${{ secrets.KUBECONFIG_TOKEN }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_TUNNEL_ID: ${{ secrets.CLOUDFLARE_TUNNEL_ID }}
-          CLOUDFLARE_DOMAIN: ${{ vars.CLOUDFLARE_DOMAIN }}
         run: |
+          application_name="$APPLICATION_NAME_INPUT"
+          if [ -z "$application_name" ]; then
+            repository_name="${GITHUB_REPOSITORY#*/}"
+            application_name=$(tr '[:upper:]' '[:lower:]' <<< "$repository_name" |
+              sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
+          fi
+          production_namespace="${PRODUCTION_NAMESPACE_INPUT:-$application_name}"
+          image_name="${IMAGE_NAME_INPUT:-$GITHUB_REPOSITORY}"
+          namespace="$application_name-$REVIEW_ID"
+          mapping_key="$application_name-$REVIEW_ID"
+          hostname="$REVIEW_ID.$REVIEW_DOMAIN"
+
           if ! [[ "$REVIEW_ID" =~ ^pr-[0-9]+$ ]]; then
             echo "Invalid review_id: $REVIEW_ID"
             exit 1
           fi
+          if ! [[ "$application_name" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || [ ${#application_name} -gt 40 ]; then
+            echo "application_name must be a lowercase DNS label with at most 40 characters"
+            exit 1
+          fi
+          if ! [[ "$production_namespace" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] ||
+            [ ${#production_namespace} -gt 63 ]; then
+            echo "production_namespace must be a lowercase DNS label with at most 63 characters"
+            exit 1
+          fi
+          if [ ${#namespace} -gt 63 ]; then
+            echo "The derived review namespace exceeds 63 characters"
+            exit 1
+          fi
+          if ! [[ "$REVIEW_DOMAIN" =~ ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$ ]]; then
+            echo "review_domain must be a lowercase fully qualified domain"
+            exit 1
+          fi
+          if ! [[ "$CLOUDFLARE_ZONE" =~ ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$ ]]; then
+            echo "cloudflare_zone must be a lowercase DNS zone"
+            exit 1
+          fi
 
           missing=()
-          for name in KUBE_SERVER KUBE_TOKEN CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_TUNNEL_ID CLOUDFLARE_DOMAIN; do
+          for name in KUBE_SERVER KUBE_TOKEN CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_TUNNEL_ID; do
             if [ -z "${!name}" ]; then
               missing+=("$name")
             fi
@@ -67,6 +151,14 @@ jobs:
             printf 'Missing required configuration: %s\n' "${missing[@]}"
             exit 1
           fi
+
+          {
+            echo "namespace=$namespace"
+            echo "production_namespace=$production_namespace"
+            echo "mapping_key=$mapping_key"
+            echo "hostname=$hostname"
+            echo "image_name=$(tr '[:upper:]' '[:lower:]' <<< "$image_name")"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Install Helm
         uses: azure/setup-helm@v5
@@ -89,7 +181,7 @@ jobs:
       - name: Allocate NodePort
         id: port
         env:
-          REVIEW_ID: ${{ inputs.review_id }}
+          MAPPING_KEY: ${{ steps.config.outputs.mapping_key }}
         run: |
           lock_owner="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB-port"
           release_lock() {
@@ -127,7 +219,7 @@ jobs:
           fi
 
           mappings=$(kubectl get configmap "$PORT_MAPPING_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" -o json)
-          port=$(jq -r --arg key "$REVIEW_ID" '.data[$key] // empty' <<< "$mappings")
+          port=$(jq -r --arg key "$MAPPING_KEY" '.data[$key] // empty' <<< "$mappings")
 
           if [ -z "$port" ]; then
             allocated=$(jq -r '.data // {} | .[]' <<< "$mappings")
@@ -142,21 +234,22 @@ jobs:
               exit 1
             fi
             kubectl patch configmap "$PORT_MAPPING_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" \
-              --type merge --patch "$(jq -cn --arg key "$REVIEW_ID" --arg port "$port" '{data:{($key):$port}}')"
+              --type merge --patch "$(jq -cn --arg key "$MAPPING_KEY" --arg port "$port" '{data:{($key):$port}}')"
           fi
 
           echo "port=$port" >> "$GITHUB_OUTPUT"
-          echo "Using NodePort $port for $REVIEW_ID"
+          echo "Using NodePort $port for $MAPPING_KEY"
 
       - name: Prepare review namespace
         env:
-          REVIEW_ID: ${{ inputs.review_id }}
+          NAMESPACE: ${{ steps.config.outputs.namespace }}
+          PRODUCTION_NAMESPACE: ${{ steps.config.outputs.production_namespace }}
+          REGISTRY_SECRET_NAME: ${{ inputs.registry_secret_name }}
         run: |
-          namespace="personal-site-$REVIEW_ID"
-          kubectl get namespace "$namespace" >/dev/null 2>&1 || kubectl create namespace "$namespace"
+          kubectl get namespace "$NAMESPACE" >/dev/null 2>&1 || kubectl create namespace "$NAMESPACE"
 
-          kubectl get secret ghcr-secret -n "$SOURCE_NAMESPACE" -o json |
-            jq --arg namespace "$namespace" '
+          kubectl get secret "$REGISTRY_SECRET_NAME" -n "$PRODUCTION_NAMESPACE" -o json |
+            jq --arg namespace "$NAMESPACE" '
               .metadata.namespace = $namespace |
               del(.metadata.creationTimestamp, .metadata.resourceVersion, .metadata.uid, .metadata.managedFields)
             ' |
@@ -164,17 +257,18 @@ jobs:
 
       - name: Deploy with Helm
         env:
+          CHART_PATH: ${{ inputs.chart_path }}
+          VALUES_FILE: ${{ inputs.values_file }}
+          RELEASE_NAME: ${{ inputs.release_name }}
+          NAMESPACE: ${{ steps.config.outputs.namespace }}
           IMAGE_TAG: ${{ inputs.image_tag }}
-          REVIEW_ID: ${{ inputs.review_id }}
+          IMAGE_REPOSITORY: ${{ inputs.registry }}/${{ steps.config.outputs.image_name }}
           NODE_PORT: ${{ steps.port.outputs.port }}
         run: |
-          image_name=$(tr '[:upper:]' '[:lower:]' <<< "${{ github.repository }}")
-          namespace="personal-site-$REVIEW_ID"
-
-          helm upgrade --install web ./helm/app \
-            --namespace "$namespace" \
-            --values ./helm/app/values-review.yaml \
-            --set-string image.repository="$REGISTRY/$image_name" \
+          helm upgrade --install "$RELEASE_NAME" "$CHART_PATH" \
+            --namespace "$NAMESPACE" \
+            --values "$VALUES_FILE" \
+            --set-string image.repository="$IMAGE_REPOSITORY" \
             --set-string image.tag="$IMAGE_TAG" \
             --set service.nodePort="$NODE_PORT" \
             --wait \
@@ -182,12 +276,11 @@ jobs:
 
       - name: Configure Cloudflare tunnel route
         env:
-          REVIEW_ID: ${{ inputs.review_id }}
+          REVIEW_HOSTNAME: ${{ steps.config.outputs.hostname }}
           NODE_PORT: ${{ steps.port.outputs.port }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_TUNNEL_ID: ${{ secrets.CLOUDFLARE_TUNNEL_ID }}
-          CLOUDFLARE_DOMAIN: ${{ vars.CLOUDFLARE_DOMAIN }}
         run: |
           lock_owner="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB-tunnel"
           release_lock() {
@@ -220,13 +313,12 @@ jobs:
             sleep 5
           done
 
-          hostname="$REVIEW_ID-review.$CLOUDFLARE_DOMAIN"
           endpoint="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/cfd_tunnel/$CLOUDFLARE_TUNNEL_ID/configurations"
           current=$(curl --fail-with-body --silent --show-error "$endpoint" \
             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
           jq -e '.success == true' <<< "$current" >/dev/null
 
-          config=$(jq --arg hostname "$hostname" --arg service "http://localhost:$NODE_PORT" '
+          config=$(jq --arg hostname "$REVIEW_HOSTNAME" --arg service "http://localhost:$NODE_PORT" '
             .result.config |
             .ingress = (((.ingress // []) | map(select(.hostname != $hostname and .service != "http_status:404")))
               + [{hostname: $hostname, service: $service}, {service: "http_status:404"}])
@@ -240,21 +332,20 @@ jobs:
 
       - name: Configure Cloudflare DNS
         env:
-          REVIEW_ID: ${{ inputs.review_id }}
+          REVIEW_HOSTNAME: ${{ steps.config.outputs.hostname }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_TUNNEL_ID: ${{ secrets.CLOUDFLARE_TUNNEL_ID }}
-          CLOUDFLARE_DOMAIN: ${{ vars.CLOUDFLARE_DOMAIN }}
+          CLOUDFLARE_ZONE: ${{ inputs.cloudflare_zone }}
         run: |
-          hostname="$REVIEW_ID-review.$CLOUDFLARE_DOMAIN"
           headers=(-H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H "Content-Type: application/json")
           zone_response=$(curl --fail-with-body --silent --show-error \
-            "https://api.cloudflare.com/client/v4/zones?name=$CLOUDFLARE_DOMAIN" "${headers[@]}")
+            "https://api.cloudflare.com/client/v4/zones?name=$CLOUDFLARE_ZONE" "${headers[@]}")
           zone_id=$(jq -er '.result[0].id' <<< "$zone_response")
           records_url="https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records"
           existing=$(curl --fail-with-body --silent --show-error \
-            "$records_url?type=CNAME&name=$hostname" "${headers[@]}")
+            "$records_url?type=CNAME&name=$REVIEW_HOSTNAME" "${headers[@]}")
           record_id=$(jq -r '.result[0].id // empty' <<< "$existing")
-          payload=$(jq -cn --arg name "$hostname" --arg content "$CLOUDFLARE_TUNNEL_ID.cfargotunnel.com" \
+          payload=$(jq -cn --arg name "$REVIEW_HOSTNAME" --arg content "$CLOUDFLARE_TUNNEL_ID.cfargotunnel.com" \
             '{type:"CNAME", name:$name, content:$content, ttl:1, proxied:true}')
 
           if [ -n "$record_id" ]; then
@@ -268,6 +359,5 @@ jobs:
 
       - name: Publish review URL
         env:
-          REVIEW_ID: ${{ inputs.review_id }}
-          CLOUDFLARE_DOMAIN: ${{ vars.CLOUDFLARE_DOMAIN }}
-        run: echo "Review app is available at https://$REVIEW_ID-review.$CLOUDFLARE_DOMAIN"
+          REVIEW_HOSTNAME: ${{ steps.config.outputs.hostname }}
+        run: echo "Review app is available at https://$REVIEW_HOSTNAME"

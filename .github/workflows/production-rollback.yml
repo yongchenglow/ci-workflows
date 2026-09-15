@@ -2,9 +2,26 @@ name: Production Rollback
 
 on:
   workflow_call:
-
-env:
-  NAMESPACE: personal-site
+    inputs:
+      application_name:
+        description: DNS-safe application name, defaults to the caller repository name
+        required: false
+        type: string
+        default: ""
+      namespace:
+        description: Kubernetes namespace, defaults to application_name
+        required: false
+        type: string
+        default: ""
+      release_name:
+        description: Helm release name
+        required: false
+        type: string
+        default: app
+      production_hostname:
+        description: Fully qualified production hostname
+        required: true
+        type: string
 
 jobs:
   rollback:
@@ -13,76 +30,79 @@ jobs:
     timeout-minutes: 10
     environment:
       name: production
-      url: https://${{ vars.CLOUDFLARE_DOMAIN }}
+      url: https://${{ inputs.production_hostname }}
     permissions:
       contents: read
+      deployments: read
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
+      - name: Validate configuration
+        id: config
+        env:
+          APPLICATION_NAME_INPUT: ${{ inputs.application_name }}
+          NAMESPACE_INPUT: ${{ inputs.namespace }}
+          PRODUCTION_HOSTNAME: ${{ inputs.production_hostname }}
+          KUBE_SERVER: ${{ secrets.KUBECONFIG_SERVER }}
+          KUBE_TOKEN: ${{ secrets.KUBECONFIG_TOKEN }}
+        run: |
+          application_name="$APPLICATION_NAME_INPUT"
+          if [ -z "$application_name" ]; then
+            repository_name="${GITHUB_REPOSITORY#*/}"
+            application_name=$(tr '[:upper:]' '[:lower:]' <<< "$repository_name" |
+              sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
+          fi
+          namespace="${NAMESPACE_INPUT:-$application_name}"
+
+          if ! [[ "$application_name" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
+            echo "application_name must be a lowercase DNS label"
+            exit 1
+          fi
+          if ! [[ "$namespace" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || [ ${#namespace} -gt 63 ]; then
+            echo "namespace must be a lowercase DNS label with at most 63 characters"
+            exit 1
+          fi
+          if ! [[ "$PRODUCTION_HOSTNAME" =~ ^[a-z0-9]([-.a-z0-9]*[a-z0-9])?$ ]]; then
+            echo "production_hostname must be a lowercase fully qualified hostname"
+            exit 1
+          fi
+          if [ -z "$KUBE_SERVER" ] || [ -z "$KUBE_TOKEN" ]; then
+            echo "KUBECONFIG_SERVER and KUBECONFIG_TOKEN are required"
+            exit 1
+          fi
+
+          echo "namespace=$namespace" >> "$GITHUB_OUTPUT"
 
       - name: Validate last deployment was successful
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          echo "Checking if there's a successful production deployment..."
-
-          # Get the last deployment to the production environment
-          LAST_DEPLOY=$(gh api \
+          last_deployment=$(gh api \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "/repos/${{ github.repository }}/deployments?environment=production&per_page=1" \
             --jq '.[0]')
 
-          if [ -z "$LAST_DEPLOY" ] || [ "$LAST_DEPLOY" = "null" ]; then
-            echo "✗ ERROR: No deployment found for production environment"
-            echo "Cannot rollback when there are no deployments."
+          if [ -z "$last_deployment" ] || [ "$last_deployment" = "null" ]; then
+            echo "No successful production deployment is available to roll back"
             exit 1
           fi
 
-          DEPLOYMENT_ID=$(echo "$LAST_DEPLOY" | jq -r '.id')
-
-          # Get the deployment status
-          DEPLOY_STATUS=$(gh api \
+          deployment_id=$(jq -r '.id' <<< "$last_deployment")
+          deployment_status=$(gh api \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "/repos/${{ github.repository }}/deployments/$DEPLOYMENT_ID/statuses" \
+            "/repos/${{ github.repository }}/deployments/$deployment_id/statuses" \
             --jq '.[0].state')
-
-          if [ "$DEPLOY_STATUS" != "success" ]; then
-            echo "✗ ERROR: Last production deployment status: $DEPLOY_STATUS"
-            echo "Cannot rollback when the last deployment was not successful."
+          if [ "$deployment_status" != "success" ]; then
+            echo "Latest production deployment status is $deployment_status, expected success"
             exit 1
           fi
-
-          echo "✓ Found successful production deployment (ID: $DEPLOYMENT_ID)"
-
-      - name: Validate required secrets
-        run: |
-          MISSING_SECRETS=()
-
-          if [ -z "${{ secrets.KUBECONFIG_SERVER }}" ]; then
-            MISSING_SECRETS+=("KUBECONFIG_SERVER")
-          fi
-          if [ -z "${{ secrets.KUBECONFIG_TOKEN }}" ]; then
-            MISSING_SECRETS+=("KUBECONFIG_TOKEN")
-          fi
-
-          if [ ${#MISSING_SECRETS[@]} -gt 0 ]; then
-            echo "✗ ERROR: Missing required secrets:"
-            printf '  - %s\n' "${MISSING_SECRETS[@]}"
-            echo ""
-            echo "Please configure these secrets in your repository settings."
-            exit 1
-          fi
-
-          echo "✓ All required secrets are configured"
 
       - name: Install Helm
         uses: azure/setup-helm@v5
         with:
-          version: "v3.22.0"
+          version: v3.22.0
 
-      - name: Setup Kubernetes config
+      - name: Configure Kubernetes
         env:
           KUBE_SERVER: ${{ secrets.KUBECONFIG_SERVER }}
           KUBE_TOKEN: ${{ secrets.KUBECONFIG_TOKEN }}
@@ -90,55 +110,32 @@ jobs:
           mkdir -p ~/.kube
           touch ~/.kube/config
           chmod 600 ~/.kube/config
-          # Cluster API is fronted by a proxied Cloudflare tunnel hostname,
-          # so the client sees Cloudflare's trusted cert (normal TLS verify).
           kubectl config set-cluster prod --server="$KUBE_SERVER"
           kubectl config set-credentials deployer --token="$KUBE_TOKEN"
           kubectl config set-context prod --cluster=prod --user=deployer
           kubectl config use-context prod
 
-      - name: Validate release exists and can be rolled back
+      - name: Validate rollback target
+        env:
+          RELEASE_NAME: ${{ inputs.release_name }}
+          NAMESPACE: ${{ steps.config.outputs.namespace }}
         run: |
-          RELEASE_NAME="web"
-
-          # Check if release exists
-          if ! helm list -n "${{ env.NAMESPACE }}" | grep -q "$RELEASE_NAME"; then
-            echo "✗ ERROR: No Helm release found for $RELEASE_NAME in namespace ${{ env.NAMESPACE }}"
-            echo "Cannot rollback a release that doesn't exist."
+          current_revision=$(helm status "$RELEASE_NAME" -n "$NAMESPACE" -o json | jq -r '.version')
+          if [ "$current_revision" -le 1 ]; then
+            echo "Release $RELEASE_NAME has no previous revision"
             exit 1
           fi
+          echo "Rolling back revision $current_revision to $((current_revision - 1))"
+          helm history "$RELEASE_NAME" -n "$NAMESPACE" --max 10
 
-          # Get current revision
-          CURRENT_REVISION=$(helm list -n "${{ env.NAMESPACE }}" -o json | jq -r '.[] | select(.name=="'$RELEASE_NAME'") | .revision')
-
-          echo "Current revision: $CURRENT_REVISION"
-
-          # Check if there's a previous revision to rollback to
-          if [ "$CURRENT_REVISION" -eq 1 ]; then
-            echo "✗ ERROR: Cannot rollback - currently at revision 1 (first deployment)"
-            echo "There is no previous revision to rollback to."
-            exit 1
-          fi
-
-          echo "✓ Rollback validation passed - will rollback from revision $CURRENT_REVISION to revision $((CURRENT_REVISION - 1))"
-
-      - name: Show deployment history
-        run: |
-          echo "Current deployment history:"
-          helm history web -n ${{ env.NAMESPACE }} --max 10
-
-      - name: Rollback Helm release
-        run: |
-          RELEASE_NAME="web"
-
-          echo "Rolling back to previous revision"
-          helm rollback "$RELEASE_NAME" -n "${{ env.NAMESPACE }}" --wait --timeout 10m
+      - name: Roll back Helm release
+        env:
+          RELEASE_NAME: ${{ inputs.release_name }}
+          NAMESPACE: ${{ steps.config.outputs.namespace }}
+        run: helm rollback "$RELEASE_NAME" -n "$NAMESPACE" --wait --timeout 10m
 
       - name: Verify rollback
-        run: |
-          kubectl rollout status deployment/web -n ${{ env.NAMESPACE }} --timeout=1m
-
-          echo ""
-          echo "Rollback completed successfully!"
-          echo "Current revision:"
-          helm list -n ${{ env.NAMESPACE }}
+        env:
+          RELEASE_NAME: ${{ inputs.release_name }}
+          NAMESPACE: ${{ steps.config.outputs.namespace }}
+        run: kubectl rollout status deployment -l "app.kubernetes.io/instance=$RELEASE_NAME" -n "$NAMESPACE" --timeout=1m
