@@ -222,7 +222,7 @@ jobs:
       packages: write
     uses: yongchenglow/ci-workflows/.github/workflows/reusable-docker.yml@v2
     with:
-      bun_version: 1.2.22
+      bun_version: 1.4.2
     secrets: inherit
 
   scan:

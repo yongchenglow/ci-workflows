@@ -11,7 +11,7 @@ deployment, and Cloudflare routing.
 | `.github/workflows/reusable-*.yml` | Build, publication, and security interfaces. |
 | `.github/workflows/production-*.yml` | Production deployment lifecycle. |
 | `.github/workflows/review-*.yml` | Review deployment lifecycle and shared allocation. |
-| `.github/workflows/lint.yml` | Workflow validation in GitHub Actions. |
+| `.github/workflows/lint.yml` | Runs `actionlint` on every PR that touches `.github/workflows/**`. |
 | `.github/actionlint.yaml` | Local and CI actionlint configuration. |
 | `.markdownlint-cli2.yaml` | Markdown lint rules and the one-line `CLAUDE.md` exception. |
 | `renovate.json` | GitHub Actions dependency updates. |

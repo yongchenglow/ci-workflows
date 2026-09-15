@@ -53,7 +53,7 @@ jobs:
       security-events: write
     uses: yongchenglow/ci-workflows/.github/workflows/reusable-build.yml@v2
     with:
-      bun_version: 1.2.22
+      bun_version: 1.4.2
 
   docker:
     needs: build
@@ -62,7 +62,7 @@ jobs:
       packages: write
     uses: yongchenglow/ci-workflows/.github/workflows/reusable-docker.yml@v2
     with:
-      bun_version: 1.2.22
+      bun_version: 1.4.2
       platforms: linux/amd64
     secrets: inherit
 ```
