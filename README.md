@@ -1,31 +1,49 @@
 # ci-workflows
 
-Central reusable GitHub Actions workflows for repositories owned by
+Reusable GitHub Actions workflows for projects owned by
 [`yongchenglow`](https://github.com/yongchenglow).
 
-The repository follows the same structure as the NUH CI workflow library:
-reusable workflows live directly in `.github/workflows`, their caller interface is
-documented here, Renovate maintains action versions, and `actionlint` validates every
-workflow change.
+The library supports a standard delivery stack built around Bun, Docker, GHCR,
+Helm, Kubernetes, and Cloudflare. Build and security workflows apply to any
+repository that meets their caller contract. Deployment workflows provide a
+generic interface for projects using the supported infrastructure.
 
-## Workflows
+## Delivery flow
+
+```mermaid
+flowchart LR
+    Caller[Caller workflow] --> Secrets[Secret scan]
+    Caller --> Build[Build and filesystem scan]
+    Build --> Image[Build and push image]
+    Secrets --> Image
+    Image --> Scan[Image security scan]
+    Scan --> Production[Production deploy]
+    Scan --> Review[Review deploy]
+    Review --> Cleanup[Review cleanup]
+```
+
+Caller repositories own event triggers and orchestration. Reusable workflows
+own the shared implementation for checks, image publication, scanning, and
+deployment.
+
+## Workflow catalogue
 
 | Workflow | Purpose |
 | --- | --- |
-| `reusable-build.yml` | Run Bun lint, type-check, tests, dependency checks, and a Trivy filesystem scan. |
+| `reusable-build.yml` | Run Bun linting, type checks, tests, dependency checks, and a Trivy filesystem scan. |
 | `reusable-secret-scan.yml` | Scan Git history with Gitleaks. |
-| `reusable-docker.yml` | Build and optionally push the application image. |
-| `reusable-security-scan.yml` | Scan the published image and fail on critical vulnerabilities. |
-| `production-deploy.yml` | Deploy the image with Helm and configure production Cloudflare routing. |
+| `reusable-docker.yml` | Build and optionally publish a container image. |
+| `reusable-security-scan.yml` | Scan a published image and block critical vulnerabilities. |
+| `production-deploy.yml` | Deploy a Helm release and configure its Cloudflare route. |
 | `production-rollback.yml` | Validate and roll back the production Helm release. |
-| `review-deploy.yml` | Allocate a stable NodePort and deploy a pull-request review environment. |
-| `review-cleanup.yml` | Remove review Kubernetes and Cloudflare resources and release its NodePort. |
+| `review-deploy.yml` | Allocate a stable NodePort and deploy a review environment. |
+| `review-cleanup.yml` | Remove review resources and release their NodePort. |
 
-## Consumer usage
+## Quick start
 
-Caller repositories retain event triggers and job orchestration. A calling job must
-grant permissions at least as broad as the called workflow and pass repository secrets
-with `secrets: inherit` where required.
+A caller invokes a reusable workflow as a job. It must grant the permissions
+required by the called workflow. GitHub documents this behavior in
+[Reuse workflows](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows).
 
 ```yaml
 jobs:
@@ -33,7 +51,7 @@ jobs:
     permissions:
       contents: read
       security-events: write
-    uses: yongchenglow/ci-workflows/.github/workflows/reusable-build.yml@v1
+    uses: yongchenglow/ci-workflows/.github/workflows/reusable-build.yml@v2
     with:
       bun_version: 1.2.22
 
@@ -42,59 +60,33 @@ jobs:
     permissions:
       contents: read
       packages: write
-    uses: yongchenglow/ci-workflows/.github/workflows/reusable-docker.yml@v1
+    uses: yongchenglow/ci-workflows/.github/workflows/reusable-docker.yml@v2
     with:
       bun_version: 1.2.22
       platforms: linux/amd64
     secrets: inherit
 ```
 
-GitHub evaluates the `github` context against the caller and `actions/checkout` checks
-out the caller repository. This lets deploy workflows use the consumer's Helm chart,
-repository variables, environments, image package, and deployment history.
+The reusable workflow checks out the caller repository. This gives deployment
+jobs access to the caller's Dockerfile, Helm chart, values files, variables,
+secrets, and deployment history.
 
-## Caller contract
+## Documentation
 
-### Build and scanning
+- [Consumer guide](docs/consumer-guide.md) covers prerequisites, configuration,
+  permissions, and every workflow interface.
+- [Operations guide](docs/operations.md) explains production and review
+  lifecycles, shared state, rollback, cleanup, and recovery.
+- [Maintainer guide](docs/maintainer-guide.md) covers safe changes, validation,
+  compatibility, and releases.
 
-- `reusable-build.yml` accepts optional `bun_version` and expects the scripts `lint`,
-  `typecheck`, `test`, and `knip`, plus `bun.lock`.
-- `reusable-secret-scan.yml` accepts optional numeric `fetch_depth` (default `0`, full
-  history).
-- `reusable-docker.yml` accepts `bun_version`, `registry` (default `ghcr.io`),
-  `image_name`, `platforms` (default `linux/amd64`), `tag_prefix`, and `push` (default
-  `true`). It outputs `image_tag` and `image_name`. The caller supplies
-  `DHI_REGISTRY_USERNAME` and `DHI_REGISTRY_PASSWORD` through inherited secrets.
-- `reusable-security-scan.yml` requires `image_tag`; `registry` and `image_name` are
-  optional. It reports critical and high findings to code scanning and blocks critical
-  vulnerabilities.
+## Versioning
 
-### Production operations
+The current interface is v2. Consumers may follow the floating `v2` tag for
+compatible updates or pin an immutable release such as `v2.0.0`. A full commit
+SHA provides the strongest protection against changes to dependencies, as
+described by GitHub's
+[secure use guidance](https://docs.github.com/en/actions/reference/security/secure-use).
 
-- `production-deploy.yml` requires `image_tag`, inherited Kubernetes and Cloudflare
-  secrets, the `CLOUDFLARE_DOMAIN` repository variable, and `helm/app` in the caller.
-  It deploys release `web` to namespace `personal-site` on NodePort `30000`.
-- `production-rollback.yml` requires inherited Kubernetes secrets and the
-  `CLOUDFLARE_DOMAIN` repository variable. It validates the latest GitHub deployment
-  before rolling back release `web` in namespace `personal-site`.
-
-### Review applications
-
-- `review-deploy.yml` requires `image_tag` and a `review_id` matching `pr-[0-9]+`, plus
-  inherited Kubernetes and Cloudflare secrets and `CLOUDFLARE_DOMAIN`. It allocates a
-  stable NodePort in `31000-31999`, deploys the caller's `helm/app` chart, and configures
-  Cloudflare DNS and tunnel ingress.
-- `review-cleanup.yml` requires the same `review_id` and infrastructure credentials. It
-  removes the review namespace, DNS record, tunnel ingress, port mapping, and GitHub
-  deployment environment.
-
-The exact secret names are `KUBECONFIG_SERVER`, `KUBECONFIG_TOKEN`,
-`CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_TUNNEL_ID`,
-`DHI_REGISTRY_USERNAME`, and `DHI_REGISTRY_PASSWORD`.
-
-## Releases
-
-Consumers use the floating `@v1` major tag. Each compatible release gets an immutable
-semantic-version tag such as `v1.0.0`, then `v1` advances to the same verified commit.
-Pinning an immutable commit SHA provides the strongest supply-chain guarantee; the
-maintained major tag provides controlled fleet-wide upgrades.
+Breaking caller contract changes require a new major version. Existing `v1`
+tags remain unchanged.
