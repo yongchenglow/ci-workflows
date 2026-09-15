@@ -43,7 +43,7 @@ They cannot be elevated by the called workflow.
 | `DHI_REGISTRY_USERNAME` | Docker build | Authenticate to Docker Hardened Images when `dhi_login` is enabled. |
 | `DHI_REGISTRY_PASSWORD` | Docker build | Authenticate to Docker Hardened Images when `dhi_login` is enabled. |
 | `KUBECONFIG_SERVER` | Deploy, rollback, cleanup | Kubernetes API server URL. |
-| `KUBECONFIG_TOKEN` | Deploy, rollback, cleanup | Kubernetes bearer token. |
+| `KUBECONFIG_TOKEN` | Deploy, rollback, cleanup | Kubernetes bearer token. Needs `list` on services in all namespaces so review deploys can skip NodePorts the cluster already holds. |
 | `CLOUDFLARE_API_TOKEN` | Deploy and cleanup | Update tunnel configuration and DNS records. |
 | `CLOUDFLARE_ACCOUNT_ID` | Deploy and cleanup | Select the Cloudflare account. |
 | `CLOUDFLARE_TUNNEL_ID` | Deploy and cleanup | Select the remotely managed tunnel. |

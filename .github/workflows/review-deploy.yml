@@ -222,7 +222,19 @@ jobs:
           port=$(jq -r --arg key "$MAPPING_KEY" '.data[$key] // empty' <<< "$mappings")
 
           if [ -z "$port" ]; then
-            allocated=$(jq -r '.data // {} | .[]' <<< "$mappings")
+            # The ConfigMap alone is not authoritative. A review namespace whose
+            # deletion timed out, or a service created outside these workflows,
+            # still holds its NodePort after the mapping is gone. Allocating from
+            # the ConfigMap only makes Helm fail with "provided port is already
+            # allocated", so treat the live cluster as the second source of truth.
+            if ! in_use=$(kubectl get svc --all-namespaces \
+              -o jsonpath='{range .items[*]}{range .spec.ports[*]}{.nodePort}{"\n"}{end}{end}'); then
+              echo "Could not list services cluster-wide to check NodePort usage."
+              echo "The deploy credential needs list access to services in all namespaces."
+              exit 1
+            fi
+            allocated=$(printf '%s\n%s\n' \
+              "$(jq -r '.data // {} | .[]' <<< "$mappings")" "$in_use")
             for candidate in $(seq "$PORT_RANGE_START" "$PORT_RANGE_END"); do
               if ! grep -qx "$candidate" <<< "$allocated"; then
                 port=$candidate
