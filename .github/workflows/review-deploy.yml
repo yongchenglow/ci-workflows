@@ -227,12 +227,23 @@ jobs:
             # still holds its NodePort after the mapping is gone. Allocating from
             # the ConfigMap only makes Helm fail with "provided port is already
             # allocated", so treat the live cluster as the second source of truth.
+            # A namespace-scoped credential can return a partial list and still
+            # exit 0, which would silently hide ports that are really taken. Fail
+            # unless the credential can genuinely list services cluster-wide.
+            if ! kubectl auth can-i list services --all-namespaces >/dev/null 2>&1; then
+              echo "The deploy credential cannot list services in all namespaces."
+              echo "NodePort collisions cannot be detected without it. Grant list"
+              echo "access to services cluster-wide and re-run."
+              exit 1
+            fi
             if ! in_use=$(kubectl get svc --all-namespaces \
               -o jsonpath='{range .items[*]}{range .spec.ports[*]}{.nodePort}{"\n"}{end}{end}'); then
               echo "Could not list services cluster-wide to check NodePort usage."
-              echo "The deploy credential needs list access to services in all namespaces."
               exit 1
             fi
+            echo "NodePorts already in use in the cluster:"
+            grep -x '[0-9]\+' <<< "$in_use" | sort -n | tr '\n' ' ' || true
+            echo
             allocated=$(printf '%s\n%s\n' \
               "$(jq -r '.data // {} | .[]' <<< "$mappings")" "$in_use")
             for candidate in $(seq "$PORT_RANGE_START" "$PORT_RANGE_END"); do
