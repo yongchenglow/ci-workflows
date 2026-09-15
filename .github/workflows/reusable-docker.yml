@@ -1,0 +1,149 @@
+name: Reusable Docker Build & Push
+
+on:
+  workflow_call:
+    inputs:
+      bun_version:
+        description: "Bun version to use (extracted from package.json by caller)"
+        required: false
+        type: string
+      registry:
+        description: "Container registry"
+        required: false
+        type: string
+        default: "ghcr.io"
+      image_name:
+        description: "Image name (defaults to repository name)"
+        required: false
+        type: string
+        default: ""
+      platforms:
+        description: "Target platforms for multi-arch builds"
+        required: false
+        type: string
+        default: "linux/amd64"
+      tag_prefix:
+        description: "Prefix for image tags (e.g., branch name)"
+        required: false
+        type: string
+        default: ""
+      push:
+        description: "Whether to push the image"
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      image_tag:
+        description: "The generated image tag"
+        value: ${{ jobs.docker.outputs.image_tag }}
+      image_name:
+        description: "The full image name (lowercase)"
+        value: ${{ jobs.docker.outputs.image_name }}
+
+jobs:
+  docker:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ steps.generate-tag.outputs.TAG }}
+      image_name: ${{ steps.image-name.outputs.IMAGE_NAME_LOWER }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hardened Images registry
+        uses: docker/login-action@v4
+        with:
+          registry: dhi.io
+          username: ${{ secrets.DHI_REGISTRY_USERNAME }}
+          password: ${{ secrets.DHI_REGISTRY_PASSWORD }}
+
+      - name: Log in to Container Registry
+        if: inputs.push
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine image name
+        id: image-name
+        run: |
+          if [ -n "${{ inputs.image_name }}" ]; then
+            IMAGE_NAME="${{ inputs.image_name }}"
+          else
+            IMAGE_NAME="${{ github.repository }}"
+          fi
+          IMAGE_NAME_LOWER=$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
+          echo "IMAGE_NAME_LOWER=$IMAGE_NAME_LOWER" >> "$GITHUB_OUTPUT"
+
+      - name: Sanitize branch name
+        id: branch-name
+        run: |
+          BRANCH_NAME="${{ github.ref_name }}"
+          SANITIZED_BRANCH=$(echo "$BRANCH_NAME" | sed 's/\//-/g' | tr '[:upper:]' '[:lower:]')
+          echo "SANITIZED=$SANITIZED_BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Generate image tag
+        id: generate-tag
+        run: |
+          if [ -n "${{ inputs.tag_prefix }}" ]; then
+            TAG="${{ inputs.tag_prefix }}-${{ github.sha }}"
+          else
+            TAG="${{ steps.branch-name.outputs.SANITIZED }}-${{ github.sha }}"
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ inputs.registry }}/${{ steps.image-name.outputs.IMAGE_NAME_LOWER }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=${{ steps.branch-name.outputs.SANITIZED }}-,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ steps.generate-tag.outputs.TAG }}
+
+      - name: Extract version from package.json
+        id: package-version
+        run: echo "VERSION=$(jq -r '.version // "0.0.0"' package.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Determine DHI Bun series tag
+        id: dhi-bun-tag
+        run: |
+          DHI_BUN_TAG=$(echo "${{ inputs.bun_version }}" | cut -d. -f1,2)
+          echo "tag=${DHI_BUN_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: ${{ inputs.push }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUN_VERSION=${{ inputs.bun_version }}
+            DHI_BUN_TAG=${{ steps.dhi-bun-tag.outputs.tag }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            REVISION=${{ github.sha }}
+            VERSION=${{ steps.package-version.outputs.VERSION }}
+          # Scope the layer cache per branch so feature branches cannot evict
+          # main's cache, but still seed from main on the first build of a branch.
+          cache-from: |
+            type=gha,scope=${{ steps.branch-name.outputs.SANITIZED }}
+            type=gha,scope=main
+          cache-to: type=gha,mode=max,scope=${{ steps.branch-name.outputs.SANITIZED }}
+          platforms: ${{ inputs.platforms }}
+
+      - name: Output image details
+        run: |
+          echo "Image: ${{ inputs.registry }}/${{ steps.image-name.outputs.IMAGE_NAME_LOWER }}:${{ steps.generate-tag.outputs.TAG }}"
+          echo "Platforms: ${{ inputs.platforms }}"

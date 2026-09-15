@@ -1,0 +1,247 @@
+name: Review App Cleanup
+
+on:
+  workflow_call:
+    inputs:
+      review_id:
+        description: Stable review identifier, such as pr-77
+        required: true
+        type: string
+
+env:
+  PORT_MAPPING_NAMESPACE: default
+  PORT_MAPPING_CONFIGMAP: yongchenglow-review-ports
+  INFRA_LOCK_CONFIGMAP: yongchenglow-review-infra-lock
+
+jobs:
+  cleanup:
+    name: Tear down ${{ inputs.review_id }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: review-app-${{ github.repository }}-${{ inputs.review_id }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      deployments: write
+    steps:
+      - name: Validate configuration
+        env:
+          REVIEW_ID: ${{ inputs.review_id }}
+          KUBE_SERVER: ${{ secrets.KUBECONFIG_SERVER }}
+          KUBE_TOKEN: ${{ secrets.KUBECONFIG_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_TUNNEL_ID: ${{ secrets.CLOUDFLARE_TUNNEL_ID }}
+          CLOUDFLARE_DOMAIN: ${{ vars.CLOUDFLARE_DOMAIN }}
+        run: |
+          if ! [[ "$REVIEW_ID" =~ ^pr-[0-9]+$ ]]; then
+            echo "Invalid review_id: $REVIEW_ID"
+            exit 1
+          fi
+          missing=()
+          for name in KUBE_SERVER KUBE_TOKEN CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_TUNNEL_ID CLOUDFLARE_DOMAIN; do
+            if [ -z "${!name}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            printf 'Missing required configuration: %s\n' "${missing[@]}"
+            exit 1
+          fi
+
+      - name: Install Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v3.22.0
+
+      - name: Configure Kubernetes
+        env:
+          KUBE_SERVER: ${{ secrets.KUBECONFIG_SERVER }}
+          KUBE_TOKEN: ${{ secrets.KUBECONFIG_TOKEN }}
+        run: |
+          mkdir -p ~/.kube
+          touch ~/.kube/config
+          chmod 600 ~/.kube/config
+          kubectl config set-cluster prod --server="$KUBE_SERVER"
+          kubectl config set-credentials deployer --token="$KUBE_TOKEN"
+          kubectl config set-context prod --cluster=prod --user=deployer
+          kubectl config use-context prod
+
+      - name: Remove Helm release and namespace
+        id: kubernetes
+        continue-on-error: true
+        env:
+          REVIEW_ID: ${{ inputs.review_id }}
+        run: |
+          namespace="personal-site-$REVIEW_ID"
+          if kubectl get namespace "$namespace" >/dev/null 2>&1; then
+            if helm status web -n "$namespace" >/dev/null 2>&1; then
+              helm uninstall web -n "$namespace" --wait --timeout 5m
+            fi
+            kubectl delete namespace "$namespace" --wait=true --timeout=5m
+          fi
+
+      - name: Remove Cloudflare tunnel route
+        id: tunnel
+        if: always()
+        continue-on-error: true
+        env:
+          REVIEW_ID: ${{ inputs.review_id }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_TUNNEL_ID: ${{ secrets.CLOUDFLARE_TUNNEL_ID }}
+          CLOUDFLARE_DOMAIN: ${{ vars.CLOUDFLARE_DOMAIN }}
+        run: |
+          lock_owner="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB-tunnel"
+          release_lock() {
+            owner=$(kubectl get configmap "$INFRA_LOCK_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" \
+              -o jsonpath='{.data.owner}' 2>/dev/null || true)
+            if [ "$owner" = "$lock_owner" ]; then
+              kubectl delete configmap "$INFRA_LOCK_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" --wait=false >/dev/null
+            fi
+          }
+          trap release_lock EXIT
+
+          deadline=$((SECONDS + 180))
+          until kubectl create configmap "$INFRA_LOCK_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" \
+            --from-literal="owner=$lock_owner" --from-literal="created_at=$(date +%s)" >/dev/null 2>&1; do
+            lock_json=$(kubectl get configmap "$INFRA_LOCK_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" -o json 2>/dev/null || echo '{}')
+            stale_owner=$(jq -r '.data.owner // empty' <<< "$lock_json")
+            created_at=$(jq -r '.data.created_at // 0' <<< "$lock_json")
+            if [[ "$created_at" =~ ^[0-9]+$ ]] && [ "$created_at" -gt 0 ] && [ $(( $(date +%s) - created_at )) -gt 120 ]; then
+              current_owner=$(kubectl get configmap "$INFRA_LOCK_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" \
+                -o jsonpath='{.data.owner}' 2>/dev/null || true)
+              if [ "$current_owner" = "$stale_owner" ]; then
+                echo "Removing stale review infrastructure lock owned by $stale_owner"
+                kubectl delete configmap "$INFRA_LOCK_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" --wait=false >/dev/null || true
+              fi
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "Timed out waiting for the review infrastructure lock"
+              exit 1
+            fi
+            sleep 5
+          done
+
+          hostname="$REVIEW_ID-review.$CLOUDFLARE_DOMAIN"
+          endpoint="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/cfd_tunnel/$CLOUDFLARE_TUNNEL_ID/configurations"
+          current=$(curl --fail-with-body --silent --show-error "$endpoint" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
+          jq -e '.success == true' <<< "$current" >/dev/null
+          config=$(jq --arg hostname "$hostname" '
+            .result.config |
+            .ingress = (((.ingress // []) | map(select(.hostname != $hostname and .service != "http_status:404")))
+              + [{service: "http_status:404"}])
+          ' <<< "$current")
+          payload=$(jq -cn --argjson config "$config" '{config:$config}')
+          response=$(curl --fail-with-body --silent --show-error -X PUT "$endpoint" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$payload")
+          jq -e '.success == true' <<< "$response" >/dev/null
+
+      - name: Remove Cloudflare DNS record
+        id: dns
+        if: always()
+        continue-on-error: true
+        env:
+          REVIEW_ID: ${{ inputs.review_id }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_DOMAIN: ${{ vars.CLOUDFLARE_DOMAIN }}
+        run: |
+          hostname="$REVIEW_ID-review.$CLOUDFLARE_DOMAIN"
+          auth=(-H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
+          zone_response=$(curl --fail-with-body --silent --show-error \
+            "https://api.cloudflare.com/client/v4/zones?name=$CLOUDFLARE_DOMAIN" "${auth[@]}")
+          zone_id=$(jq -er '.result[0].id' <<< "$zone_response")
+          records_url="https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records"
+          existing=$(curl --fail-with-body --silent --show-error \
+            "$records_url?type=CNAME&name=$hostname" "${auth[@]}")
+          record_id=$(jq -r '.result[0].id // empty' <<< "$existing")
+          if [ -n "$record_id" ]; then
+            response=$(curl --fail-with-body --silent --show-error -X DELETE \
+              "$records_url/$record_id" "${auth[@]}")
+            jq -e '.success == true' <<< "$response" >/dev/null
+          fi
+
+      - name: Release NodePort
+        id: port
+        if: always()
+        continue-on-error: true
+        env:
+          REVIEW_ID: ${{ inputs.review_id }}
+        run: |
+          lock_owner="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB-port"
+          release_lock() {
+            owner=$(kubectl get configmap "$INFRA_LOCK_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" \
+              -o jsonpath='{.data.owner}' 2>/dev/null || true)
+            if [ "$owner" = "$lock_owner" ]; then
+              kubectl delete configmap "$INFRA_LOCK_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" --wait=false >/dev/null
+            fi
+          }
+          trap release_lock EXIT
+
+          deadline=$((SECONDS + 180))
+          until kubectl create configmap "$INFRA_LOCK_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" \
+            --from-literal="owner=$lock_owner" --from-literal="created_at=$(date +%s)" >/dev/null 2>&1; do
+            lock_json=$(kubectl get configmap "$INFRA_LOCK_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" -o json 2>/dev/null || echo '{}')
+            stale_owner=$(jq -r '.data.owner // empty' <<< "$lock_json")
+            created_at=$(jq -r '.data.created_at // 0' <<< "$lock_json")
+            if [[ "$created_at" =~ ^[0-9]+$ ]] && [ "$created_at" -gt 0 ] && [ $(( $(date +%s) - created_at )) -gt 120 ]; then
+              current_owner=$(kubectl get configmap "$INFRA_LOCK_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" \
+                -o jsonpath='{.data.owner}' 2>/dev/null || true)
+              if [ "$current_owner" = "$stale_owner" ]; then
+                echo "Removing stale review infrastructure lock owned by $stale_owner"
+                kubectl delete configmap "$INFRA_LOCK_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" --wait=false >/dev/null || true
+              fi
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "Timed out waiting for the review infrastructure lock"
+              exit 1
+            fi
+            sleep 5
+          done
+
+          if kubectl get configmap "$PORT_MAPPING_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" >/dev/null 2>&1; then
+            mappings=$(kubectl get configmap "$PORT_MAPPING_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" -o json)
+            if jq -e --arg key "$REVIEW_ID" '.data[$key] != null' <<< "$mappings" >/dev/null; then
+              kubectl patch configmap "$PORT_MAPPING_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" \
+                --type json --patch "$(jq -cn --arg key "$REVIEW_ID" '[{op:"remove",path:("/data/" + $key)}]')"
+            fi
+          fi
+
+      - name: Mark GitHub deployments inactive
+        id: deployments
+        if: always()
+        continue-on-error: true
+        uses: actions/github-script@v9
+        env:
+          ENVIRONMENT_NAME: review/${{ inputs.review_id }}
+        with:
+          script: |
+            const deployments = await github.paginate(github.rest.repos.listDeployments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              environment: process.env.ENVIRONMENT_NAME,
+            });
+            for (const deployment of deployments) {
+              await github.rest.repos.createDeploymentStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                deployment_id: deployment.id,
+                state: "inactive",
+              });
+            }
+
+      - name: Report cleanup failures
+        if: >-
+          always() &&
+          (steps.kubernetes.outcome == 'failure' ||
+           steps.tunnel.outcome == 'failure' ||
+           steps.dns.outcome == 'failure' ||
+           steps.port.outcome == 'failure' ||
+           steps.deployments.outcome == 'failure')
+        run: |
+          echo "One or more review-app resources could not be removed; inspect the failed steps above."
+          exit 1

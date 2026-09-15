@@ -1,0 +1,113 @@
+name: Reusable Build Workflow
+
+on:
+  workflow_call:
+    inputs:
+      bun_version:
+        description: "Bun version to use (extracted from package.json by caller)"
+        required: false
+        type: string
+
+jobs:
+  # lint, type-check, test and knip all need the same prepared checkout, so they
+  # run as one matrix rather than four near-identical job definitions. Each leg
+  # restores the shared node_modules cache and installs only on a miss, which
+  # removes the need for a separate cache-warming job ahead of them.
+  checks:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Lint
+            command: bun run lint
+          - name: type-check
+            command: bun run typecheck
+          - name: Test
+            command: bun run test
+          - name: Dependency Check
+            command: bun run knip
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ inputs.bun_version }}
+
+      - name: Restore node_modules cache
+        id: cache-node-modules
+        uses: actions/cache@v6
+        with:
+          path: node_modules
+          key: node-modules-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+
+      - name: Install dependencies
+        if: steps.cache-node-modules.outputs.cache-hit != 'true'
+        run: bun install --frozen-lockfile
+
+      - name: ${{ matrix.name }}
+        run: ${{ matrix.command }}
+
+  security-scan:
+    name: Filesystem Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      # Scan once into Trivy's own JSON, then derive both the SARIF upload and
+      # the pass/fail gate from that file. `convert` reads the saved results, so
+      # neither step re-downloads the vulnerability database.
+      - name: Run Trivy scanner (vulnerabilities & misconfigurations)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "json"
+          output: "trivy-results.json"
+          severity: "CRITICAL"
+          scanners: "vuln,misconfig"
+          skip-dirs: "docs"
+
+      - name: Convert results to SARIF
+        run: trivy convert --format sarif --output trivy-results.sarif trivy-results.json
+
+      - name: Upload Trivy results to code scanning
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: "trivy-results.sarif"
+
+      - name: Fail on critical findings
+        run: |
+          # Gate on Trivy's own Severity field rather than the SARIF level:
+          # Trivy maps both CRITICAL and HIGH to SARIF level "error", so
+          # matching on that would block HIGH findings too. Misconfigurations
+          # live under .Misconfigurations, vulnerabilities under
+          # .Vulnerabilities; both are filtered to CRITICAL above, but this
+          # re-checks Severity so the gate does not depend on that filter.
+          VULNS=$(jq '[.Results[]?.Vulnerabilities[]?
+            | select(.Severity == "CRITICAL")] | length' trivy-results.json)
+          MISCONF=$(jq '[.Results[]?.Misconfigurations[]?
+            | select(.Severity == "CRITICAL")] | length' trivy-results.json)
+          CRITICAL=$((VULNS + MISCONF))
+
+          echo "Critical findings: $VULNS vulnerabilities, $MISCONF misconfigurations"
+
+          if [ "$CRITICAL" -gt 0 ]; then
+            echo "✗ Trivy found $CRITICAL CRITICAL finding(s):"
+            jq -r '.Results[]? | .Target as $t
+              | (.Vulnerabilities[]? | select(.Severity == "CRITICAL")
+                  | "  - [\($t)] \(.VulnerabilityID) \(.PkgName) \(.InstalledVersion) -> \(.FixedVersion // "no fix")"),
+                (.Misconfigurations[]? | select(.Severity == "CRITICAL")
+                  | "  - [\($t)] \(.ID): \(.Title)")' trivy-results.json
+            exit 1
+          fi
+          echo "✓ No CRITICAL findings"

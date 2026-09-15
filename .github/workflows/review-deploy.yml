@@ -1,0 +1,273 @@
+name: Review App Deploy
+
+on:
+  workflow_call:
+    inputs:
+      image_tag:
+        description: Docker image tag to deploy
+        required: true
+        type: string
+      review_id:
+        description: Stable review identifier, such as pr-77
+        required: true
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  SOURCE_NAMESPACE: personal-site
+  PORT_MAPPING_NAMESPACE: default
+  PORT_MAPPING_CONFIGMAP: yongchenglow-review-ports
+  INFRA_LOCK_CONFIGMAP: yongchenglow-review-infra-lock
+  PORT_RANGE_START: 31000
+  PORT_RANGE_END: 31999
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.review_id }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Prevent an older update or a close event racing this PR's deployment.
+    # Cross-PR shared state is protected by a Kubernetes-backed mutex below.
+    concurrency:
+      group: review-app-${{ github.repository }}-${{ inputs.review_id }}
+      cancel-in-progress: false
+    environment:
+      name: review/${{ inputs.review_id }}
+      url: https://${{ inputs.review_id }}-review.${{ vars.CLOUDFLARE_DOMAIN }}
+    permissions:
+      contents: read
+      packages: read
+      deployments: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Validate configuration
+        env:
+          REVIEW_ID: ${{ inputs.review_id }}
+          KUBE_SERVER: ${{ secrets.KUBECONFIG_SERVER }}
+          KUBE_TOKEN: ${{ secrets.KUBECONFIG_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_TUNNEL_ID: ${{ secrets.CLOUDFLARE_TUNNEL_ID }}
+          CLOUDFLARE_DOMAIN: ${{ vars.CLOUDFLARE_DOMAIN }}
+        run: |
+          if ! [[ "$REVIEW_ID" =~ ^pr-[0-9]+$ ]]; then
+            echo "Invalid review_id: $REVIEW_ID"
+            exit 1
+          fi
+
+          missing=()
+          for name in KUBE_SERVER KUBE_TOKEN CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_TUNNEL_ID CLOUDFLARE_DOMAIN; do
+            if [ -z "${!name}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            printf 'Missing required configuration: %s\n' "${missing[@]}"
+            exit 1
+          fi
+
+      - name: Install Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v3.22.0
+
+      - name: Configure Kubernetes
+        env:
+          KUBE_SERVER: ${{ secrets.KUBECONFIG_SERVER }}
+          KUBE_TOKEN: ${{ secrets.KUBECONFIG_TOKEN }}
+        run: |
+          mkdir -p ~/.kube
+          touch ~/.kube/config
+          chmod 600 ~/.kube/config
+          kubectl config set-cluster prod --server="$KUBE_SERVER"
+          kubectl config set-credentials deployer --token="$KUBE_TOKEN"
+          kubectl config set-context prod --cluster=prod --user=deployer
+          kubectl config use-context prod
+
+      - name: Allocate NodePort
+        id: port
+        env:
+          REVIEW_ID: ${{ inputs.review_id }}
+        run: |
+          lock_owner="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB-port"
+          release_lock() {
+            owner=$(kubectl get configmap "$INFRA_LOCK_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" \
+              -o jsonpath='{.data.owner}' 2>/dev/null || true)
+            if [ "$owner" = "$lock_owner" ]; then
+              kubectl delete configmap "$INFRA_LOCK_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" --wait=false >/dev/null
+            fi
+          }
+          trap release_lock EXIT
+
+          deadline=$((SECONDS + 180))
+          until kubectl create configmap "$INFRA_LOCK_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" \
+            --from-literal="owner=$lock_owner" --from-literal="created_at=$(date +%s)" >/dev/null 2>&1; do
+            lock_json=$(kubectl get configmap "$INFRA_LOCK_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" -o json 2>/dev/null || echo '{}')
+            stale_owner=$(jq -r '.data.owner // empty' <<< "$lock_json")
+            created_at=$(jq -r '.data.created_at // 0' <<< "$lock_json")
+            if [[ "$created_at" =~ ^[0-9]+$ ]] && [ "$created_at" -gt 0 ] && [ $(( $(date +%s) - created_at )) -gt 120 ]; then
+              current_owner=$(kubectl get configmap "$INFRA_LOCK_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" \
+                -o jsonpath='{.data.owner}' 2>/dev/null || true)
+              if [ "$current_owner" = "$stale_owner" ]; then
+                echo "Removing stale review infrastructure lock owned by $stale_owner"
+                kubectl delete configmap "$INFRA_LOCK_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" --wait=false >/dev/null || true
+              fi
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "Timed out waiting for the review infrastructure lock"
+              exit 1
+            fi
+            sleep 5
+          done
+
+          if ! kubectl get configmap "$PORT_MAPPING_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" >/dev/null 2>&1; then
+            kubectl create configmap "$PORT_MAPPING_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE"
+          fi
+
+          mappings=$(kubectl get configmap "$PORT_MAPPING_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" -o json)
+          port=$(jq -r --arg key "$REVIEW_ID" '.data[$key] // empty' <<< "$mappings")
+
+          if [ -z "$port" ]; then
+            allocated=$(jq -r '.data // {} | .[]' <<< "$mappings")
+            for candidate in $(seq "$PORT_RANGE_START" "$PORT_RANGE_END"); do
+              if ! grep -qx "$candidate" <<< "$allocated"; then
+                port=$candidate
+                break
+              fi
+            done
+            if [ -z "$port" ]; then
+              echo "No free NodePort in $PORT_RANGE_START-$PORT_RANGE_END"
+              exit 1
+            fi
+            kubectl patch configmap "$PORT_MAPPING_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" \
+              --type merge --patch "$(jq -cn --arg key "$REVIEW_ID" --arg port "$port" '{data:{($key):$port}}')"
+          fi
+
+          echo "port=$port" >> "$GITHUB_OUTPUT"
+          echo "Using NodePort $port for $REVIEW_ID"
+
+      - name: Prepare review namespace
+        env:
+          REVIEW_ID: ${{ inputs.review_id }}
+        run: |
+          namespace="personal-site-$REVIEW_ID"
+          kubectl get namespace "$namespace" >/dev/null 2>&1 || kubectl create namespace "$namespace"
+
+          kubectl get secret ghcr-secret -n "$SOURCE_NAMESPACE" -o json |
+            jq --arg namespace "$namespace" '
+              .metadata.namespace = $namespace |
+              del(.metadata.creationTimestamp, .metadata.resourceVersion, .metadata.uid, .metadata.managedFields)
+            ' |
+            kubectl apply -f -
+
+      - name: Deploy with Helm
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          REVIEW_ID: ${{ inputs.review_id }}
+          NODE_PORT: ${{ steps.port.outputs.port }}
+        run: |
+          image_name=$(tr '[:upper:]' '[:lower:]' <<< "${{ github.repository }}")
+          namespace="personal-site-$REVIEW_ID"
+
+          helm upgrade --install web ./helm/app \
+            --namespace "$namespace" \
+            --values ./helm/app/values-review.yaml \
+            --set-string image.repository="$REGISTRY/$image_name" \
+            --set-string image.tag="$IMAGE_TAG" \
+            --set service.nodePort="$NODE_PORT" \
+            --wait \
+            --timeout 10m
+
+      - name: Configure Cloudflare tunnel route
+        env:
+          REVIEW_ID: ${{ inputs.review_id }}
+          NODE_PORT: ${{ steps.port.outputs.port }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_TUNNEL_ID: ${{ secrets.CLOUDFLARE_TUNNEL_ID }}
+          CLOUDFLARE_DOMAIN: ${{ vars.CLOUDFLARE_DOMAIN }}
+        run: |
+          lock_owner="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB-tunnel"
+          release_lock() {
+            owner=$(kubectl get configmap "$INFRA_LOCK_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" \
+              -o jsonpath='{.data.owner}' 2>/dev/null || true)
+            if [ "$owner" = "$lock_owner" ]; then
+              kubectl delete configmap "$INFRA_LOCK_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" --wait=false >/dev/null
+            fi
+          }
+          trap release_lock EXIT
+
+          deadline=$((SECONDS + 180))
+          until kubectl create configmap "$INFRA_LOCK_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" \
+            --from-literal="owner=$lock_owner" --from-literal="created_at=$(date +%s)" >/dev/null 2>&1; do
+            lock_json=$(kubectl get configmap "$INFRA_LOCK_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" -o json 2>/dev/null || echo '{}')
+            stale_owner=$(jq -r '.data.owner // empty' <<< "$lock_json")
+            created_at=$(jq -r '.data.created_at // 0' <<< "$lock_json")
+            if [[ "$created_at" =~ ^[0-9]+$ ]] && [ "$created_at" -gt 0 ] && [ $(( $(date +%s) - created_at )) -gt 120 ]; then
+              current_owner=$(kubectl get configmap "$INFRA_LOCK_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" \
+                -o jsonpath='{.data.owner}' 2>/dev/null || true)
+              if [ "$current_owner" = "$stale_owner" ]; then
+                echo "Removing stale review infrastructure lock owned by $stale_owner"
+                kubectl delete configmap "$INFRA_LOCK_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" --wait=false >/dev/null || true
+              fi
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "Timed out waiting for the review infrastructure lock"
+              exit 1
+            fi
+            sleep 5
+          done
+
+          hostname="$REVIEW_ID-review.$CLOUDFLARE_DOMAIN"
+          endpoint="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/cfd_tunnel/$CLOUDFLARE_TUNNEL_ID/configurations"
+          current=$(curl --fail-with-body --silent --show-error "$endpoint" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
+          jq -e '.success == true' <<< "$current" >/dev/null
+
+          config=$(jq --arg hostname "$hostname" --arg service "http://localhost:$NODE_PORT" '
+            .result.config |
+            .ingress = (((.ingress // []) | map(select(.hostname != $hostname and .service != "http_status:404")))
+              + [{hostname: $hostname, service: $service}, {service: "http_status:404"}])
+          ' <<< "$current")
+          payload=$(jq -cn --argjson config "$config" '{config:$config}')
+          response=$(curl --fail-with-body --silent --show-error -X PUT "$endpoint" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$payload")
+          jq -e '.success == true' <<< "$response" >/dev/null
+
+      - name: Configure Cloudflare DNS
+        env:
+          REVIEW_ID: ${{ inputs.review_id }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_TUNNEL_ID: ${{ secrets.CLOUDFLARE_TUNNEL_ID }}
+          CLOUDFLARE_DOMAIN: ${{ vars.CLOUDFLARE_DOMAIN }}
+        run: |
+          hostname="$REVIEW_ID-review.$CLOUDFLARE_DOMAIN"
+          headers=(-H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H "Content-Type: application/json")
+          zone_response=$(curl --fail-with-body --silent --show-error \
+            "https://api.cloudflare.com/client/v4/zones?name=$CLOUDFLARE_DOMAIN" "${headers[@]}")
+          zone_id=$(jq -er '.result[0].id' <<< "$zone_response")
+          records_url="https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records"
+          existing=$(curl --fail-with-body --silent --show-error \
+            "$records_url?type=CNAME&name=$hostname" "${headers[@]}")
+          record_id=$(jq -r '.result[0].id // empty' <<< "$existing")
+          payload=$(jq -cn --arg name "$hostname" --arg content "$CLOUDFLARE_TUNNEL_ID.cfargotunnel.com" \
+            '{type:"CNAME", name:$name, content:$content, ttl:1, proxied:true}')
+
+          if [ -n "$record_id" ]; then
+            response=$(curl --fail-with-body --silent --show-error -X PUT "$records_url/$record_id" \
+              "${headers[@]}" --data "$payload")
+          else
+            response=$(curl --fail-with-body --silent --show-error -X POST "$records_url" \
+              "${headers[@]}" --data "$payload")
+          fi
+          jq -e '.success == true' <<< "$response" >/dev/null
+
+      - name: Publish review URL
+        env:
+          REVIEW_ID: ${{ inputs.review_id }}
+          CLOUDFLARE_DOMAIN: ${{ vars.CLOUDFLARE_DOMAIN }}
+        run: echo "Review app is available at https://$REVIEW_ID-review.$CLOUDFLARE_DOMAIN"

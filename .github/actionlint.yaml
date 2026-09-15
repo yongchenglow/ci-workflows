@@ -1,0 +1,8 @@
+self-hosted-runner:
+  enabled: false
+
+shellcheck:
+  enabled: true
+
+pyflakes:
+  enabled: true
