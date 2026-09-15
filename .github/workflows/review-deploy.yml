@@ -182,6 +182,8 @@ jobs:
         id: port
         env:
           MAPPING_KEY: ${{ steps.config.outputs.mapping_key }}
+          NAMESPACE: ${{ steps.config.outputs.namespace }}
+          RELEASE_NAME: ${{ inputs.release_name }}
         run: |
           lock_owner="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB-port"
           release_lock() {
@@ -221,31 +223,47 @@ jobs:
           mappings=$(kubectl get configmap "$PORT_MAPPING_CONFIGMAP" -n "$PORT_MAPPING_NAMESPACE" -o json)
           port=$(jq -r --arg key "$MAPPING_KEY" '.data[$key] // empty' <<< "$mappings")
 
+          # The ConfigMap is not authoritative on its own. A review namespace whose
+          # deletion timed out, a service created outside these workflows, or a
+          # mapping this workflow wrote before a failed Helm release all leave the
+          # record and the cluster disagreeing. Read the ports the cluster actually
+          # holds and treat them as the second source of truth.
+          #
+          # A credential without cluster-scoped list access makes kubectl print
+          # "Forbidden" to stderr and still exit 0, which would leave the port list
+          # empty and silently hide ports that are really taken. Check the
+          # permission explicitly rather than trusting the exit status.
+          if ! kubectl auth can-i list services --all-namespaces >/dev/null 2>&1; then
+            echo "The deploy credential cannot list services in all namespaces."
+            echo "NodePort collisions cannot be detected without it. Grant list"
+            echo "access to services cluster-wide and re-run."
+            exit 1
+          fi
+
+          # Ports held by this release's own service are not conflicts. Excluding
+          # them keeps a redeploy on the port it already serves.
+          in_use=$(kubectl get svc --all-namespaces -o json |
+            jq -r --arg ns "$NAMESPACE" --arg name "$RELEASE_NAME" '
+              .items[]
+              | select(.metadata.namespace != $ns or .metadata.name != $name)
+              | .spec.ports[]? | select(.nodePort != null) | .nodePort | tostring')
+
+          echo "NodePorts held elsewhere in the cluster:"
+          sort -n <<< "$in_use" | tr '\n' ' '
+          echo
+
+          # A stored mapping is only reusable if the port is still free. Otherwise
+          # the collision repeats on every run, because a failed release leaves the
+          # mapping behind and this step would keep handing back the same port.
+          if [ -n "$port" ] && grep -qx "$port" <<< "$in_use"; then
+            echo "Mapped NodePort $port is held by another service. Reallocating."
+            port=""
+          fi
+
           if [ -z "$port" ]; then
-            # The ConfigMap alone is not authoritative. A review namespace whose
-            # deletion timed out, or a service created outside these workflows,
-            # still holds its NodePort after the mapping is gone. Allocating from
-            # the ConfigMap only makes Helm fail with "provided port is already
-            # allocated", so treat the live cluster as the second source of truth.
-            # A namespace-scoped credential can return a partial list and still
-            # exit 0, which would silently hide ports that are really taken. Fail
-            # unless the credential can genuinely list services cluster-wide.
-            if ! kubectl auth can-i list services --all-namespaces >/dev/null 2>&1; then
-              echo "The deploy credential cannot list services in all namespaces."
-              echo "NodePort collisions cannot be detected without it. Grant list"
-              echo "access to services cluster-wide and re-run."
-              exit 1
-            fi
-            if ! in_use=$(kubectl get svc --all-namespaces \
-              -o jsonpath='{range .items[*]}{range .spec.ports[*]}{.nodePort}{"\n"}{end}{end}'); then
-              echo "Could not list services cluster-wide to check NodePort usage."
-              exit 1
-            fi
-            echo "NodePorts already in use in the cluster:"
-            grep -x '[0-9]\+' <<< "$in_use" | sort -n | tr '\n' ' ' || true
-            echo
             allocated=$(printf '%s\n%s\n' \
-              "$(jq -r '.data // {} | .[]' <<< "$mappings")" "$in_use")
+              "$(jq -r --arg key "$MAPPING_KEY" '.data // {} | to_entries[] | select(.key != $key) | .value' <<< "$mappings")" \
+              "$in_use")
             for candidate in $(seq "$PORT_RANGE_START" "$PORT_RANGE_END"); do
               if ! grep -qx "$candidate" <<< "$allocated"; then
                 port=$candidate
