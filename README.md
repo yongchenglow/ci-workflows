@@ -33,7 +33,7 @@ jobs:
     permissions:
       contents: read
       security-events: write
-    uses: yongchenglow/ci-workflows/.github/workflows/reusable-build.yml@main
+    uses: yongchenglow/ci-workflows/.github/workflows/reusable-build.yml@v1
     with:
       bun_version: 1.2.22
 
@@ -42,7 +42,7 @@ jobs:
     permissions:
       contents: read
       packages: write
-    uses: yongchenglow/ci-workflows/.github/workflows/reusable-docker.yml@main
+    uses: yongchenglow/ci-workflows/.github/workflows/reusable-docker.yml@v1
     with:
       bun_version: 1.2.22
       platforms: linux/amd64
@@ -94,8 +94,7 @@ The exact secret names are `KUBECONFIG_SERVER`, `KUBECONFIG_TOKEN`,
 
 ## Releases
 
-Consumers currently use the floating `@main` ref so the first version can be bootstrapped
-from this empty repository. After the initial commit is published and verified, create a
-protected `v1` release tag and update consumers to `@v1`. Pinning an immutable commit SHA
-provides the strongest supply-chain guarantee; a maintained major tag provides controlled
-fleet-wide upgrades.
+Consumers use the floating `@v1` major tag. Each compatible release gets an immutable
+semantic-version tag such as `v1.0.0`, then `v1` advances to the same verified commit.
+Pinning an immutable commit SHA provides the strongest supply-chain guarantee; the
+maintained major tag provides controlled fleet-wide upgrades.
