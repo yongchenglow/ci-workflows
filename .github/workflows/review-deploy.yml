@@ -59,6 +59,25 @@ on:
         required: false
         type: string
         default: ghcr-secret
+    # Declared so callers can forward these by name instead of passing every
+    # repository secret with `secrets: inherit`. The workflow cannot reach the
+    # cluster or publish a route without them, so all are required.
+    secrets:
+      KUBECONFIG_SERVER:
+        description: Kubernetes API server URL
+        required: true
+      KUBECONFIG_TOKEN:
+        description: Kubernetes bearer token
+        required: true
+      CLOUDFLARE_API_TOKEN:
+        description: Cloudflare token for tunnel configuration and DNS records
+        required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        description: Cloudflare account containing the tunnel
+        required: true
+      CLOUDFLARE_TUNNEL_ID:
+        description: Remotely managed Cloudflare tunnel
+        required: true
 
 env:
   PORT_MAPPING_NAMESPACE: default

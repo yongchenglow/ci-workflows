@@ -44,6 +44,16 @@ on:
       image_name:
         description: "The full image name (lowercase)"
         value: ${{ jobs.docker.outputs.image_name }}
+    # Declared so callers can forward these by name instead of passing every
+    # repository secret with `secrets: inherit`. Both are optional because they
+    # are only read when `dhi_login` is enabled.
+    secrets:
+      DHI_REGISTRY_USERNAME:
+        description: "Docker Hardened Images username, required when dhi_login is enabled"
+        required: false
+      DHI_REGISTRY_PASSWORD:
+        description: "Docker Hardened Images password, required when dhi_login is enabled"
+        required: false
 
 jobs:
   docker:

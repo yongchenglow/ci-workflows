@@ -69,7 +69,10 @@ jobs:
     with:
       bun_version: 1.4.2
       platforms: linux/amd64
-    secrets: inherit
+      dhi_login: true
+    secrets:
+      DHI_REGISTRY_USERNAME: ${{ secrets.DHI_REGISTRY_USERNAME }}
+      DHI_REGISTRY_PASSWORD: ${{ secrets.DHI_REGISTRY_PASSWORD }}
 ```
 
 The reusable workflow checks out the caller repository. This gives deployment

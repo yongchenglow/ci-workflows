@@ -22,6 +22,17 @@ on:
         description: Fully qualified production hostname
         required: true
         type: string
+    # Declared so callers can forward these by name instead of passing every
+    # repository secret with `secrets: inherit`. Rollback changes the Helm
+    # release only, so it needs no Cloudflare access: the route already points
+    # at the release and does not move.
+    secrets:
+      KUBECONFIG_SERVER:
+        description: Kubernetes API server URL
+        required: true
+      KUBECONFIG_TOKEN:
+        description: Kubernetes bearer token
+        required: true
 
 jobs:
   rollback:

@@ -48,11 +48,47 @@ They cannot be elevated by the called workflow.
 | `CLOUDFLARE_ACCOUNT_ID` | Deploy and cleanup | Select the Cloudflare account. |
 | `CLOUDFLARE_TUNNEL_ID` | Deploy and cleanup | Select the remotely managed tunnel. |
 
-`GITHUB_TOKEN` is provided by GitHub. Pass repository secrets with
-`secrets: inherit` when calling workflows that require them. Cloudflare
-recommends scoped API tokens for API access. Its
+`GITHUB_TOKEN` is provided by GitHub. Cloudflare recommends scoped API tokens
+for API access. Its
 [DNS record API](https://developers.cloudflare.com/api/resources/dns/subresources/records/methods/create/)
 documents the required DNS write permission.
+
+Every workflow that reads a secret declares it, so callers can forward secrets
+by name:
+
+| Workflow | Declared secrets |
+| --- | --- |
+| `reusable-docker.yml` | `DHI_REGISTRY_USERNAME`, `DHI_REGISTRY_PASSWORD`, both optional |
+| `production-deploy.yml` | Kubernetes and Cloudflare, all required |
+| `review-deploy.yml` | Kubernetes and Cloudflare, all required |
+| `review-cleanup.yml` | Kubernetes and Cloudflare, all required |
+| `production-rollback.yml` | `KUBECONFIG_SERVER`, `KUBECONFIG_TOKEN`, both required |
+
+`reusable-build.yml`, `reusable-secret-scan.yml`, `reusable-security-scan.yml`,
+and `helm-lint.yml` declare no secrets. They use the automatically provided
+`GITHUB_TOKEN`, so calls to them need no `secrets:` block at all.
+
+Prefer naming secrets over `secrets: inherit`. Inherit passes every repository
+secret to the called workflow, including secrets the job does not use. An image
+build that needs two registry credentials would also receive the Kubernetes
+token and the Cloudflare credentials, and that build runs on pull requests.
+
+```yaml
+docker:
+  uses: yongchenglow/ci-workflows/.github/workflows/reusable-docker.yml@v2
+  secrets:
+    DHI_REGISTRY_USERNAME: ${{ secrets.DHI_REGISTRY_USERNAME }}
+    DHI_REGISTRY_PASSWORD: ${{ secrets.DHI_REGISTRY_PASSWORD }}
+```
+
+`secrets: inherit` continues to work. The declarations are additive, so callers
+written against an earlier v2 release need no change.
+
+Named secrets limit which secrets a job can reach, but the values still live at
+the repository level. Binding deployment credentials to a GitHub environment
+scopes them further, so a job without that environment cannot read them at all.
+GitHub describes this in
+[Using environments for deployment](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments).
 
 ### Variables
 
@@ -323,7 +359,10 @@ jobs:
     uses: yongchenglow/ci-workflows/.github/workflows/reusable-docker.yml@v2
     with:
       bun_version: 1.4.2
-    secrets: inherit
+      dhi_login: true
+    secrets:
+      DHI_REGISTRY_USERNAME: ${{ secrets.DHI_REGISTRY_USERNAME }}
+      DHI_REGISTRY_PASSWORD: ${{ secrets.DHI_REGISTRY_PASSWORD }}
 
   scan:
     needs: docker
@@ -334,7 +373,6 @@ jobs:
     uses: yongchenglow/ci-workflows/.github/workflows/reusable-security-scan.yml@v2
     with:
       image_tag: ${{ needs.docker.outputs.image_tag }}
-    secrets: inherit
 
   deploy:
     needs: [docker, scan]
@@ -349,7 +387,12 @@ jobs:
       production_hostname: storefront.example.com
       cloudflare_zone: example.com
       production_node_port: 30001
-    secrets: inherit
+    secrets:
+      KUBECONFIG_SERVER: ${{ secrets.KUBECONFIG_SERVER }}
+      KUBECONFIG_TOKEN: ${{ secrets.KUBECONFIG_TOKEN }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_TUNNEL_ID: ${{ secrets.CLOUDFLARE_TUNNEL_ID }}
 ```
 
 ### Review lifecycle
@@ -369,7 +412,12 @@ jobs:
       application_name: storefront
       review_domain: review.example.com
       cloudflare_zone: example.com
-    secrets: inherit
+    secrets:
+      KUBECONFIG_SERVER: ${{ secrets.KUBECONFIG_SERVER }}
+      KUBECONFIG_TOKEN: ${{ secrets.KUBECONFIG_TOKEN }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_TUNNEL_ID: ${{ secrets.CLOUDFLARE_TUNNEL_ID }}
 
   cleanup:
     if: github.event.action == 'closed'
@@ -382,7 +430,12 @@ jobs:
       application_name: storefront
       review_domain: review.example.com
       cloudflare_zone: example.com
-    secrets: inherit
+    secrets:
+      KUBECONFIG_SERVER: ${{ secrets.KUBECONFIG_SERVER }}
+      KUBECONFIG_TOKEN: ${{ secrets.KUBECONFIG_TOKEN }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_TUNNEL_ID: ${{ secrets.CLOUDFLARE_TUNNEL_ID }}
 ```
 
 Fork pull requests must not receive deployment credentials. Keep build and
