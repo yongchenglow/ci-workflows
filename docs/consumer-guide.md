@@ -68,12 +68,48 @@ subdomain or review apps use a dedicated domain.
 | --- | --- |
 | Build | `contents: read`, `security-events: write` |
 | Secret scan | `contents: read`, `security-events: write` |
+| Helm lint | `contents: read` |
 | Docker build | `contents: read`, `packages: write` |
 | Image scan | `contents: read`, `packages: read`, `security-events: write` |
 | Production deploy | `contents: read`, `packages: read`, `deployments: write` |
 | Production rollback | `contents: read`, `deployments: read` |
 | Review deploy | `contents: read`, `packages: read`, `deployments: write` |
 | Review cleanup | `contents: read`, `deployments: write` |
+
+## Composite actions
+
+### `bun-version`
+
+Reusable workflows take `bun_version` as an input, and `with:` cannot run a
+script. This action reads the value from the caller's `package.json`
+`packageManager` field so each caller does not repeat the lookup.
+
+| Input | Required | Default | Meaning |
+| --- | --- | --- | --- |
+| `working-directory` | No | `.` | Directory containing `package.json`. |
+
+| Output | Meaning |
+| --- | --- |
+| `bun_version` | Version from `packageManager`, without the name prefix. |
+
+The action reads a file, so the caller checks out first. A sparse checkout of
+`package.json` is enough when the job needs nothing else.
+
+```yaml
+bun-version:
+  runs-on: ubuntu-latest
+  permissions:
+    contents: read
+  outputs:
+    bun_version: ${{ steps.bun.outputs.bun_version }}
+  steps:
+    - uses: actions/checkout@v7
+      with:
+        sparse-checkout: package.json
+        sparse-checkout-cone-mode: false
+    - id: bun
+      uses: yongchenglow/ci-workflows/.github/actions/bun-version@v2
+```
 
 ## Build and scanning workflows
 
@@ -100,6 +136,43 @@ misconfigurations fail the job. Findings are uploaded to GitHub code scanning.
 Gitleaks scans the checked-out Git history. A shallow value speeds up scanning
 but can miss secrets in older commits.
 
+### `helm-lint.yml`
+
+| Input | Required | Default | Meaning |
+| --- | --- | --- | --- |
+| `chart_path` | Yes | None | Chart directory in the caller repository. |
+| `profiles` | Yes | None | Newline separated `release\|values_file\|namespace` entries. |
+| `strict` | No | `true` | Treat chart warnings as failures. |
+| `helm_version` | No | `latest` | Version passed to `azure/setup-helm`, which requires it. |
+| `image_tag` | No | Placeholder branch and SHA tag | Tag substituted while rendering. |
+| `image_repository` | No | `ghcr.io/example/app` | Repository substituted while rendering. |
+
+Each profile is linted and rendered independently, so a values file that is
+valid for one environment cannot mask a failure in another. The job collects
+every failure before exiting rather than stopping at the first.
+
+`helm lint` parses templates but does not prove they render. The workflow also
+runs `helm template`, which catches errors that appear only once values are
+substituted, such as a missing required value or an invalid resource field.
+
+A chart may validate the image tag format. Committed values files often carry a
+placeholder that such a chart rejects, because the deploy workflows always
+supply a real tag. `image_tag` and `image_repository` reproduce that
+substitution so rendering matches deployment. Override them when a chart
+enforces a specific format.
+
+```yaml
+helm-validate:
+  permissions:
+    contents: read
+  uses: yongchenglow/ci-workflows/.github/workflows/helm-lint.yml@v2
+  with:
+    chart_path: helm/app
+    profiles: |
+      web|helm/app/values-production.yaml|personal-site
+      web|helm/app/values-review.yaml|personal-site-review
+```
+
 ### `reusable-docker.yml`
 
 | Input | Required | Default | Meaning |
@@ -120,6 +193,33 @@ but can miss secrets in older commits.
 The caller Dockerfile must accept `BUN_VERSION`, `DHI_BUN_TAG`,
 `BUILD_DATE`, `REVISION`, and `VERSION` if it uses those values.
 `package.json` supplies the package version.
+
+#### Building before the gates finish
+
+`push` lets a caller overlap the image build with its quality gates instead of
+queuing behind them. Call the workflow twice: once with `push: false` alongside
+the gates, then once with `push: true` after they pass.
+
+The layer cache makes the second call cheap. `cache-to` runs whether or not the
+image is published, and both calls read the same branch scope, so the publishing
+call restores every layer the first one built.
+
+```yaml
+docker:
+  needs: bun-version
+  uses: yongchenglow/ci-workflows/.github/workflows/reusable-docker.yml@v2
+  with:
+    push: false
+
+docker-push:
+  needs: [docker, build, secret-scan, helm-validate]
+  uses: yongchenglow/ci-workflows/.github/workflows/reusable-docker.yml@v2
+  with:
+    push: true
+```
+
+Both calls must receive identical inputs. Differing build arguments produce a
+cache miss, and differing tag inputs publish a tag the gates never covered.
 
 ### `reusable-security-scan.yml`
 

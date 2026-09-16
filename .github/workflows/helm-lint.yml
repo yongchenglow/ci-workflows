@@ -1,0 +1,138 @@
+name: Reusable Helm Lint
+
+on:
+  workflow_call:
+    inputs:
+      chart_path:
+        description: "Path to the Helm chart directory"
+        required: true
+        type: string
+      profiles:
+        description: |
+          Newline separated deployment profiles to lint and render, one per
+          line, in the form `release|values_file|namespace`. Each profile is
+          linted and templated independently so a values file that is valid for
+          one environment cannot mask a failure in another.
+        required: true
+        type: string
+      strict:
+        description: "Treat chart warnings as failures"
+        required: false
+        type: boolean
+        default: true
+      image_tag:
+        description: |
+          Image tag substituted while rendering. A chart may validate the tag
+          format, in which case the placeholder in a committed values file will
+          not render. The deploy workflows always pass a real tag, so linting
+          supplies a representative one to reproduce their rendering.
+        required: false
+        type: string
+        default: "main-0000000000000000000000000000000000000000"
+      image_repository:
+        description: "Image repository substituted while rendering"
+        required: false
+        type: string
+        default: "ghcr.io/example/app"
+      helm_version:
+        description: "Helm version passed to azure/setup-helm, which requires it"
+        required: false
+        type: string
+        default: "latest"
+
+jobs:
+  helm-lint:
+    name: Helm Lint and Render
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: ${{ inputs.helm_version }}
+
+      # Rendering needs any declared dependencies present. A chart without a
+      # Chart.lock or dependencies is unaffected, so this runs unconditionally.
+      - name: Build chart dependencies
+        env:
+          CHART_PATH: ${{ inputs.chart_path }}
+        run: helm dependency build "$CHART_PATH" || true
+
+      # Lint and render every profile in one step. Each profile is validated on
+      # its own so a failure names the values file that caused it, and the loop
+      # collects all failures before exiting rather than stopping at the first.
+      - name: Lint and render each profile
+        env:
+          CHART_PATH: ${{ inputs.chart_path }}
+          PROFILES: ${{ inputs.profiles }}
+          STRICT: ${{ inputs.strict }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          IMAGE_REPOSITORY: ${{ inputs.image_repository }}
+        run: |
+          STRICT_FLAG=""
+          if [ "$STRICT" = "true" ]; then
+            STRICT_FLAG="--strict"
+          fi
+
+          FAILED=0
+          while IFS='|' read -r RELEASE VALUES_FILE NAMESPACE; do
+            # Skip blank lines produced by the trailing newline of a YAML block
+            # scalar, and any line a caller leaves blank for readability.
+            [ -z "$(echo "$RELEASE" | tr -d '[:space:]')" ] && continue
+
+            RELEASE=$(echo "$RELEASE" | xargs)
+            VALUES_FILE=$(echo "$VALUES_FILE" | xargs)
+            NAMESPACE=$(echo "$NAMESPACE" | xargs)
+
+            if [ -z "$VALUES_FILE" ] || [ -z "$NAMESPACE" ]; then
+              echo "✗ Malformed profile, expected release|values_file|namespace: $RELEASE"
+              FAILED=1
+              continue
+            fi
+
+            if [ ! -f "$VALUES_FILE" ]; then
+              echo "✗ [$RELEASE] values file not found: $VALUES_FILE"
+              FAILED=1
+              continue
+            fi
+
+            echo "→ [$RELEASE] linting with $VALUES_FILE in namespace $NAMESPACE"
+            # shellcheck disable=SC2086
+            if ! helm lint "$CHART_PATH" \
+              --values "$VALUES_FILE" \
+              --set-string "image.tag=$IMAGE_TAG" \
+              --set-string "image.repository=$IMAGE_REPOSITORY" \
+              $STRICT_FLAG; then
+              echo "✗ [$RELEASE] helm lint failed"
+              FAILED=1
+              continue
+            fi
+
+            # `lint` parses templates but does not prove they render. Templating
+            # catches the errors that only appear once values are substituted,
+            # such as a missing required value or an invalid resource field.
+            echo "→ [$RELEASE] rendering manifests"
+            if ! helm template "$RELEASE" "$CHART_PATH" \
+              --values "$VALUES_FILE" \
+              --namespace "$NAMESPACE" \
+              --set-string "image.tag=$IMAGE_TAG" \
+              --set-string "image.repository=$IMAGE_REPOSITORY" \
+              > /dev/null; then
+              echo "✗ [$RELEASE] helm template failed"
+              FAILED=1
+              continue
+            fi
+
+            echo "✓ [$RELEASE] chart is valid"
+          done <<< "$PROFILES"
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "✗ One or more Helm profiles failed validation"
+            exit 1
+          fi
+          echo "✓ All Helm profiles are valid"

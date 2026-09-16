@@ -1,0 +1,41 @@
+name: Extract Bun Version
+description: >
+  Read the Bun version from a caller repository's package.json packageManager
+  field. Callers need this value as a `with:` input to reusable workflows, and
+  `with:` cannot run a script, so the lookup happens here instead of being
+  repeated in every caller.
+
+inputs:
+  working-directory:
+    description: "Directory containing package.json"
+    required: false
+    default: "."
+
+outputs:
+  bun_version:
+    description: "Bun version from the packageManager field, without the name prefix"
+    value: ${{ steps.get-bun-version.outputs.bun_version }}
+
+runs:
+  using: composite
+  steps:
+    # The caller checks out its own repository before invoking this action. A
+    # sparse checkout of package.json is enough when the job needs nothing else.
+    - name: Get Bun version from package.json
+      id: get-bun-version
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        if [ ! -f package.json ]; then
+          echo "✗ ERROR: package.json not found in $(pwd)"
+          exit 1
+        fi
+
+        BUN_VERSION=$(jq -r '.packageManager | split("@")[1]' package.json)
+        if [ -z "$BUN_VERSION" ] || [ "$BUN_VERSION" = "null" ]; then
+          echo "✗ ERROR: Could not read bun version from package.json packageManager field"
+          exit 1
+        fi
+
+        echo "bun_version=$BUN_VERSION" >> "$GITHUB_OUTPUT"
+        echo "✓ Bun version: $BUN_VERSION"

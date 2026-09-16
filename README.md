@@ -14,9 +14,13 @@ generic interface for projects using the supported infrastructure.
 flowchart LR
     Caller[Caller workflow] --> Secrets[Secret scan]
     Caller --> Build[Build and filesystem scan]
-    Build --> Image[Build and push image]
-    Secrets --> Image
-    Image --> Scan[Image security scan]
+    Caller --> Helm[Helm lint and render]
+    Caller --> Image[Build image]
+    Build --> Publish[Publish image]
+    Secrets --> Publish
+    Helm --> Publish
+    Image --> Publish
+    Publish --> Scan[Image security scan]
     Scan --> Production[Production deploy]
     Scan --> Review[Review deploy]
     Review --> Cleanup[Review cleanup]
@@ -32,6 +36,7 @@ deployment.
 | --- | --- |
 | `reusable-build.yml` | Run Bun linting, type checks, tests, dependency checks, and a Trivy filesystem scan. |
 | `reusable-secret-scan.yml` | Scan Git history with Gitleaks. |
+| `helm-lint.yml` | Lint and render a Helm chart for every deployment profile. |
 | `reusable-docker.yml` | Build and optionally publish a container image. |
 | `reusable-security-scan.yml` | Scan a published image and block critical vulnerabilities. |
 | `production-deploy.yml` | Deploy a Helm release and configure its Cloudflare route. |
