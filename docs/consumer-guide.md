@@ -48,11 +48,47 @@ They cannot be elevated by the called workflow.
 | `CLOUDFLARE_ACCOUNT_ID` | Deploy and cleanup | Select the Cloudflare account. |
 | `CLOUDFLARE_TUNNEL_ID` | Deploy and cleanup | Select the remotely managed tunnel. |
 
-`GITHUB_TOKEN` is provided by GitHub. Pass repository secrets with
-`secrets: inherit` when calling workflows that require them. Cloudflare
-recommends scoped API tokens for API access. Its
+`GITHUB_TOKEN` is provided by GitHub. Cloudflare recommends scoped API tokens
+for API access. Its
 [DNS record API](https://developers.cloudflare.com/api/resources/dns/subresources/records/methods/create/)
 documents the required DNS write permission.
+
+Every workflow that reads a secret declares it, so callers can forward secrets
+by name:
+
+| Workflow | Declared secrets |
+| --- | --- |
+| `reusable-docker.yml` | `DHI_REGISTRY_USERNAME`, `DHI_REGISTRY_PASSWORD`, both optional |
+| `production-deploy.yml` | Kubernetes and Cloudflare, all required |
+| `review-deploy.yml` | Kubernetes and Cloudflare, all required |
+| `review-cleanup.yml` | Kubernetes and Cloudflare, all required |
+| `production-rollback.yml` | `KUBECONFIG_SERVER`, `KUBECONFIG_TOKEN`, both required |
+
+`reusable-build.yml`, `reusable-secret-scan.yml`, `reusable-security-scan.yml`,
+and `helm-lint.yml` declare no secrets. They use the automatically provided
+`GITHUB_TOKEN`, so calls to them need no `secrets:` block at all.
+
+Prefer naming secrets over `secrets: inherit`. Inherit passes every repository
+secret to the called workflow, including secrets the job does not use. An image
+build that needs two registry credentials would also receive the Kubernetes
+token and the Cloudflare credentials, and that build runs on pull requests.
+
+```yaml
+docker:
+  uses: yongchenglow/ci-workflows/.github/workflows/reusable-docker.yml@v2
+  secrets:
+    DHI_REGISTRY_USERNAME: ${{ secrets.DHI_REGISTRY_USERNAME }}
+    DHI_REGISTRY_PASSWORD: ${{ secrets.DHI_REGISTRY_PASSWORD }}
+```
+
+`secrets: inherit` continues to work. The declarations are additive, so callers
+written against an earlier v2 release need no change.
+
+Named secrets limit which secrets a job can reach, but the values still live at
+the repository level. Binding deployment credentials to a GitHub environment
+scopes them further, so a job without that environment cannot read them at all.
+GitHub describes this in
+[Using environments for deployment](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments).
 
 ### Variables
 
@@ -68,12 +104,48 @@ subdomain or review apps use a dedicated domain.
 | --- | --- |
 | Build | `contents: read`, `security-events: write` |
 | Secret scan | `contents: read`, `security-events: write` |
+| Helm lint | `contents: read` |
 | Docker build | `contents: read`, `packages: write` |
 | Image scan | `contents: read`, `packages: read`, `security-events: write` |
 | Production deploy | `contents: read`, `packages: read`, `deployments: write` |
 | Production rollback | `contents: read`, `deployments: read` |
 | Review deploy | `contents: read`, `packages: read`, `deployments: write` |
 | Review cleanup | `contents: read`, `deployments: write` |
+
+## Composite actions
+
+### `bun-version`
+
+Reusable workflows take `bun_version` as an input, and `with:` cannot run a
+script. This action reads the value from the caller's `package.json`
+`packageManager` field so each caller does not repeat the lookup.
+
+| Input | Required | Default | Meaning |
+| --- | --- | --- | --- |
+| `working-directory` | No | `.` | Directory containing `package.json`. |
+
+| Output | Meaning |
+| --- | --- |
+| `bun_version` | Version from `packageManager`, without the name prefix. |
+
+The action reads a file, so the caller checks out first. A sparse checkout of
+`package.json` is enough when the job needs nothing else.
+
+```yaml
+bun-version:
+  runs-on: ubuntu-latest
+  permissions:
+    contents: read
+  outputs:
+    bun_version: ${{ steps.bun.outputs.bun_version }}
+  steps:
+    - uses: actions/checkout@v7
+      with:
+        sparse-checkout: package.json
+        sparse-checkout-cone-mode: false
+    - id: bun
+      uses: yongchenglow/ci-workflows/.github/actions/bun-version@v2
+```
 
 ## Build and scanning workflows
 
@@ -100,6 +172,43 @@ misconfigurations fail the job. Findings are uploaded to GitHub code scanning.
 Gitleaks scans the checked-out Git history. A shallow value speeds up scanning
 but can miss secrets in older commits.
 
+### `helm-lint.yml`
+
+| Input | Required | Default | Meaning |
+| --- | --- | --- | --- |
+| `chart_path` | Yes | None | Chart directory in the caller repository. |
+| `profiles` | Yes | None | Newline separated `release\|values_file\|namespace` entries. |
+| `strict` | No | `true` | Treat chart warnings as failures. |
+| `helm_version` | No | `latest` | Version passed to `azure/setup-helm`, which requires it. |
+| `image_tag` | No | Placeholder branch and SHA tag | Tag substituted while rendering. |
+| `image_repository` | No | `ghcr.io/example/app` | Repository substituted while rendering. |
+
+Each profile is linted and rendered independently, so a values file that is
+valid for one environment cannot mask a failure in another. The job collects
+every failure before exiting rather than stopping at the first.
+
+`helm lint` parses templates but does not prove they render. The workflow also
+runs `helm template`, which catches errors that appear only once values are
+substituted, such as a missing required value or an invalid resource field.
+
+A chart may validate the image tag format. Committed values files often carry a
+placeholder that such a chart rejects, because the deploy workflows always
+supply a real tag. `image_tag` and `image_repository` reproduce that
+substitution so rendering matches deployment. Override them when a chart
+enforces a specific format.
+
+```yaml
+helm-validate:
+  permissions:
+    contents: read
+  uses: yongchenglow/ci-workflows/.github/workflows/helm-lint.yml@v2
+  with:
+    chart_path: helm/app
+    profiles: |
+      web|helm/app/values-production.yaml|personal-site
+      web|helm/app/values-review.yaml|personal-site-review
+```
+
 ### `reusable-docker.yml`
 
 | Input | Required | Default | Meaning |
@@ -120,6 +229,33 @@ but can miss secrets in older commits.
 The caller Dockerfile must accept `BUN_VERSION`, `DHI_BUN_TAG`,
 `BUILD_DATE`, `REVISION`, and `VERSION` if it uses those values.
 `package.json` supplies the package version.
+
+#### Building before the gates finish
+
+`push` lets a caller overlap the image build with its quality gates instead of
+queuing behind them. Call the workflow twice: once with `push: false` alongside
+the gates, then once with `push: true` after they pass.
+
+The layer cache makes the second call cheap. `cache-to` runs whether or not the
+image is published, and both calls read the same branch scope, so the publishing
+call restores every layer the first one built.
+
+```yaml
+docker:
+  needs: bun-version
+  uses: yongchenglow/ci-workflows/.github/workflows/reusable-docker.yml@v2
+  with:
+    push: false
+
+docker-push:
+  needs: [docker, build, secret-scan, helm-validate]
+  uses: yongchenglow/ci-workflows/.github/workflows/reusable-docker.yml@v2
+  with:
+    push: true
+```
+
+Both calls must receive identical inputs. Differing build arguments produce a
+cache miss, and differing tag inputs publish a tag the gates never covered.
 
 ### `reusable-security-scan.yml`
 
@@ -223,7 +359,10 @@ jobs:
     uses: yongchenglow/ci-workflows/.github/workflows/reusable-docker.yml@v2
     with:
       bun_version: 1.4.2
-    secrets: inherit
+      dhi_login: true
+    secrets:
+      DHI_REGISTRY_USERNAME: ${{ secrets.DHI_REGISTRY_USERNAME }}
+      DHI_REGISTRY_PASSWORD: ${{ secrets.DHI_REGISTRY_PASSWORD }}
 
   scan:
     needs: docker
@@ -234,7 +373,6 @@ jobs:
     uses: yongchenglow/ci-workflows/.github/workflows/reusable-security-scan.yml@v2
     with:
       image_tag: ${{ needs.docker.outputs.image_tag }}
-    secrets: inherit
 
   deploy:
     needs: [docker, scan]
@@ -249,7 +387,12 @@ jobs:
       production_hostname: storefront.example.com
       cloudflare_zone: example.com
       production_node_port: 30001
-    secrets: inherit
+    secrets:
+      KUBECONFIG_SERVER: ${{ secrets.KUBECONFIG_SERVER }}
+      KUBECONFIG_TOKEN: ${{ secrets.KUBECONFIG_TOKEN }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_TUNNEL_ID: ${{ secrets.CLOUDFLARE_TUNNEL_ID }}
 ```
 
 ### Review lifecycle
@@ -269,7 +412,12 @@ jobs:
       application_name: storefront
       review_domain: review.example.com
       cloudflare_zone: example.com
-    secrets: inherit
+    secrets:
+      KUBECONFIG_SERVER: ${{ secrets.KUBECONFIG_SERVER }}
+      KUBECONFIG_TOKEN: ${{ secrets.KUBECONFIG_TOKEN }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_TUNNEL_ID: ${{ secrets.CLOUDFLARE_TUNNEL_ID }}
 
   cleanup:
     if: github.event.action == 'closed'
@@ -282,7 +430,12 @@ jobs:
       application_name: storefront
       review_domain: review.example.com
       cloudflare_zone: example.com
-    secrets: inherit
+    secrets:
+      KUBECONFIG_SERVER: ${{ secrets.KUBECONFIG_SERVER }}
+      KUBECONFIG_TOKEN: ${{ secrets.KUBECONFIG_TOKEN }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_TUNNEL_ID: ${{ secrets.CLOUDFLARE_TUNNEL_ID }}
 ```
 
 Fork pull requests must not receive deployment credentials. Keep build and
