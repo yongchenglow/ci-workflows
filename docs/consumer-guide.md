@@ -325,13 +325,13 @@ Review deployment and cleanup must receive the same
 | `release_name` | No | `app` | Helm release name. |
 | `chart_path` | No | `./helm/app` | Chart path in the caller repository. |
 | `values_file` | No | `./helm/app/values-review.yaml` | Review values file. |
-| `review_domain` | Yes | None | Domain appended to the review ID. |
+| `review_domain` | Yes | None | Domain appended to `application_name-review_id`. |
 | `cloudflare_zone` | Yes | None | Cloudflare zone containing the review domain. |
 | `registry_secret_name` | No | `ghcr-secret` | Pull secret copied into the review namespace. |
 
 For `application_name: storefront`, `review_id: pr-42`, and
-`review_domain: review.example.com`, the workflow creates namespace
-`storefront-pr-42` and hostname `pr-42.review.example.com`.
+`review_domain: example.com`, the workflow creates namespace
+`storefront-pr-42` and hostname `storefront-pr-42.example.com`.
 
 ### `review-cleanup.yml`
 
@@ -410,7 +410,7 @@ jobs:
       image_tag: ${{ needs.docker.outputs.image_tag }}
       review_id: pr-${{ github.event.number }}
       application_name: storefront
-      review_domain: review.example.com
+      review_domain: example.com
       cloudflare_zone: example.com
     secrets:
       KUBECONFIG_SERVER: ${{ secrets.KUBECONFIG_SERVER }}
@@ -428,7 +428,7 @@ jobs:
     with:
       review_id: pr-${{ github.event.number }}
       application_name: storefront
-      review_domain: review.example.com
+      review_domain: example.com
       cloudflare_zone: example.com
     secrets:
       KUBECONFIG_SERVER: ${{ secrets.KUBECONFIG_SERVER }}

@@ -18,7 +18,7 @@ on:
         type: string
         default: app
       review_domain:
-        description: Domain appended to review_id, such as review.example.com
+        description: Domain appended to application_name-review_id, such as example.com
         required: true
         type: string
       cloudflare_zone:
@@ -83,7 +83,7 @@ jobs:
           fi
           namespace="$application_name-$REVIEW_ID"
           mapping_key="$application_name-$REVIEW_ID"
-          hostname="$REVIEW_ID.$REVIEW_DOMAIN"
+          hostname="$application_name-$REVIEW_ID.$REVIEW_DOMAIN"
 
           if ! [[ "$REVIEW_ID" =~ ^pr-[0-9]+$ ]]; then
             echo "Invalid review_id: $REVIEW_ID"
