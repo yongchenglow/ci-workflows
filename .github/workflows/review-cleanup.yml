@@ -123,7 +123,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Install Helm
-        uses: azure/setup-helm@v5
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5
         with:
           version: v3.22.0
 
@@ -284,7 +284,7 @@ jobs:
         id: deployments
         if: always()
         continue-on-error: true
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
           ENVIRONMENT_NAME: review/${{ inputs.review_id }}
         with:

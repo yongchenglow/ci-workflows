@@ -155,12 +155,16 @@ actions. Do not perform them as part of an ordinary code change.
 Renovate manages GitHub Actions versions each Monday before 09:00 in
 Asia/Singapore. It groups most action updates and keeps Trivy updates separate.
 
+Every action reference is pinned to a full commit SHA with the version in a
+trailing comment, for example `actions/checkout@<sha> # v7`. Renovate keeps
+the SHA and the comment in step (`pinDigests: true`). A moved or hijacked
+upstream tag cannot change what callers run, which matters because these
+workflows receive deployment and registry credentials. GitHub's
+[secure use reference](https://docs.github.com/en/actions/reference/security/secure-use)
+recommends this practice. Pin any new action the same way.
+
 Review dependency changes for release notes, input changes, runner
 requirements, and permissions. Run actionlint after accepting an update.
-GitHub's
-[secure use reference](https://docs.github.com/en/actions/reference/security/secure-use)
-recommends full commit SHA pinning when immutable dependency resolution is
-required.
 
 ## Documentation maintenance
 

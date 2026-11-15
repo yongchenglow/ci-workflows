@@ -11,7 +11,7 @@
   "enabledManagers": ["github-actions"],
   "github-actions": {
     "enabled": true,
-    "pinDigests": false
+    "pinDigests": true
   },
   "packageRules": [
     {
