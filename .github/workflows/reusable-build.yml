@@ -31,16 +31,16 @@ jobs:
             command: bun run knip
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: ${{ inputs.bun_version }}
 
       - name: Restore node_modules cache
         id: cache-node-modules
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: node_modules
           key: node-modules-${{ runner.os }}-${{ hashFiles('bun.lock') }}
@@ -61,13 +61,13 @@ jobs:
       security-events: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # Scan once into Trivy's own JSON, then derive both the SARIF upload and
       # the pass/fail gate from that file. `convert` reads the saved results, so
       # neither step re-downloads the vulnerability database.
       - name: Run Trivy scanner (vulnerabilities & misconfigurations)
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: "fs"
           scan-ref: "."
@@ -81,7 +81,7 @@ jobs:
         run: trivy convert --format sarif --output trivy-results.sarif trivy-results.json
 
       - name: Upload Trivy results to code scanning
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
         with:
           sarif_file: "trivy-results.sarif"
 

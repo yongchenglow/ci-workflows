@@ -156,6 +156,11 @@ runs four matrix legs. The required package scripts are `lint`, `typecheck`,
 `test`, and `knip`. Bun describes reproducible installation in its
 [`bun install` documentation](https://bun.sh/docs/pm/cli/install).
 
+Each script must fail on a problem rather than fix it. A `lint` script that
+writes fixes, such as `biome lint --write`, rewrites the CI checkout and exits
+successfully, so unformatted or unfixed code still passes. Point `lint` at a
+read-only check such as `biome ci .` and keep fixers in a separate script.
+
 | Input | Required | Default | Meaning |
 | --- | --- | --- | --- |
 | `bun_version` | No | Latest resolved by setup-bun | Bun version used for checks. |
